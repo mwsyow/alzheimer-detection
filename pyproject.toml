@@ -1,0 +1,20 @@
+[project]
+name = "nn-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "nibabel>=5.4.2",
+    "openpyxl>=3.1.5",
+    "python-dotenv>=1.2.2",
+    "monai>=1.6.0",
+    "scikit-learn>=1.8.0",
+    "wandb>=0.28.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "nilearn[plotting]>=0.14.0",
+]
