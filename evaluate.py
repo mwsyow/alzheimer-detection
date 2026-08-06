@@ -1,5 +1,4 @@
 import argparse
-import glob
 import json
 from pathlib import Path
 
@@ -7,7 +6,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 import wandb
-from monai.data import DataLoader
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -17,11 +15,10 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from torch.utils.data import Subset
 
-from datasets import Dataset, get_data
+from datasets import build_test_loader
 from models import build_model
-from train import build_loss, build_transforms
+from train import build_loss
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -35,25 +32,6 @@ def load_checkpoint_and_metadata(checkpoint_path: Path):
     metadata_path = checkpoint_path.parent / "metadata.pth"
     metadata = torch.load(metadata_path, map_location="cpu")
     return checkpoint, metadata
-
-
-def build_test_loader(config, test_idx: list[int]):
-    img_paths = [Path(path) for path in sorted(glob.glob(config["image_glob"]))]
-    if not img_paths:
-        raise FileNotFoundError(
-            f"No MRI images matched image_glob={config['image_glob']!r}"
-        )
-
-    dataset_items = get_data(img_paths, Path(config["label_path"]))
-    mri_dataset = Dataset(data=dataset_items, transform=build_transforms(config))
-    test_set = Subset(mri_dataset, test_idx)
-    dataloader_config = config["dataloader"]
-    return DataLoader(
-        test_set,
-        batch_size=dataloader_config["batch_size"],
-        shuffle=False,
-        num_workers=dataloader_config["num_workers"],
-    ), dataset_items
 
 
 def evaluate(model, loss, test_loader, device: torch.device):

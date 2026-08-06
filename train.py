@@ -1,25 +1,15 @@
 import argparse
 import copy
-import glob
 import json
 from pathlib import Path
 
 import torch
 from dotenv import load_dotenv
-from monai.data import DataLoader, NibabelReader
-from monai.transforms import (
-    Compose,
-    EnsureChannelFirstd,
-    EnsureTyped,
-    LoadImaged,
-    NormalizeIntensityd,
-    Resized,
-)
+from monai.data import DataLoader
 from torch import nn
-from torch.utils.data import Subset
 
 import wandb
-from datasets import Dataset, get_data, stratified_three_way_split
+from datasets import build_dataset_items, build_split_indices, build_train_val_loaders
 from models import build_model
 
 load_dotenv(override=True)
@@ -61,9 +51,13 @@ DEFAULT_CONFIG = {
         "resize": True,
         "spatial_size": [96, 128, 96],
         "resize_mode": "trilinear",
+        "scale_intensity": False,
         "normalize_intensity": True,
         "normalize_nonzero": True,
         "normalize_channel_wise": True,
+        "rand_rotate90": False,
+        "rand_rotate90_prob": 0.5,
+        "rand_rotate90_spatial_axes": [0, 2],
     },
     "split": {
         "train_size": 0.70,
@@ -339,41 +333,6 @@ def accuracy(output, labels):
     return (output.argmax(dim=1) == labels).float().mean()
 
 
-def build_transforms(config):
-    transform_config = config["transforms"]
-    transforms = [
-        LoadImaged(
-            keys=["image"],
-            reader=NibabelReader(squeeze_non_spatial_dims=True),
-            image_only=True,
-        ),
-        EnsureChannelFirstd(keys=["image"], channel_dim="no_channel"),
-    ]
-    if transform_config["resize"]:
-        transforms.append(
-            Resized(
-                keys=["image"],
-                spatial_size=tuple(transform_config["spatial_size"]),
-                mode=transform_config["resize_mode"],
-            )
-        )
-    if transform_config["normalize_intensity"]:
-        transforms.append(
-            NormalizeIntensityd(
-                keys=["image"],
-                nonzero=transform_config["normalize_nonzero"],
-                channel_wise=transform_config["normalize_channel_wise"],
-            )
-        )
-    transforms.extend(
-        [
-            EnsureTyped(keys=["image"], dtype=torch.float32),
-            EnsureTyped(keys=["label"], dtype=torch.long),
-        ]
-    )
-    return Compose(transforms)
-
-
 def build_loss(config):
     loss_config = config["loss"]
     if loss_config["name"] != "CrossEntropyLoss":
@@ -402,57 +361,24 @@ def runner(
     device = torch.device(requested_device)
     config.update({"device": str(device)}, allow_val_change=True)
 
-    img_paths = [Path(path) for path in sorted(glob.glob(config["image_glob"]))]
-    if not img_paths:
-        raise FileNotFoundError(
-            f"No MRI images matched image_glob={config['image_glob']!r}"
-        )
-    label_path = Path(config["label_path"])
-    dataset_items = get_data(img_paths, label_path)
+    dataset_items = build_dataset_items(config)
 
     checkpoint_dir = get_checkpoint_dir(run, config)
     if is_resume:
         split_indices = metadata["split"]
-        train_idx = split_indices["train_idx"]
-        val_idx = split_indices["val_idx"]
-        test_idx = split_indices["test_idx"]
     else:
-        split_config = config["split"]
-        train_idx, val_idx, test_idx = stratified_three_way_split(
-            dataset_items=dataset_items,
-            train_size=split_config["train_size"],
-            val_size=split_config["val_size"],
-            test_size=split_config["test_size"],
-            random_seed=split_config["random_seed"],
-        )
+        split_indices = build_split_indices(dataset_items, config)
         save_metadata(
             checkpoint_dir=checkpoint_dir,
             run=run,
             config=config,
-            split_indices={
-                "train_idx": train_idx,
-                "val_idx": val_idx,
-                "test_idx": test_idx,
-            },
+            split_indices=split_indices,
         )
 
-    mri_transforms = build_transforms(config)
-    mri_dataset = Dataset(data=dataset_items, transform=mri_transforms)
-    train_set = Subset(mri_dataset, train_idx)
-    val_set = Subset(mri_dataset, val_idx)
-
-    dataloader_config = config["dataloader"]
-    train_loader = DataLoader(
-        train_set,
-        batch_size=dataloader_config["batch_size"],
-        shuffle=True,
-        num_workers=dataloader_config["num_workers"],
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=dataloader_config["batch_size"],
-        shuffle=False,
-        num_workers=dataloader_config["num_workers"],
+    train_loader, val_loader = build_train_val_loaders(
+        dataset_items=dataset_items,
+        split_indices=split_indices,
+        config=config,
     )
 
     loss = build_loss(config)
