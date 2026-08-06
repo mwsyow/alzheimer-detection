@@ -15,77 +15,6 @@ from models import build_model
 load_dotenv(override=True)
 
 
-DEFAULT_CONFIG = {
-    "epochs": 1,
-    "device": "auto",
-    "image_glob": "data/T88_111_masked/*masked_gfc.img",
-    "label_path": "data/oasis_cross-sectional_cdr_cleaned.xlsx",
-    "wandb_entity": "wmarcellius123",
-    "wandb_project": "alzheimer-detection",
-    "wandb_name": None,
-    "wandb_mode": "online",
-    "model": {
-        "name": "Simple3DCNN",
-        "params": {
-            "num_classes": 2,
-            "in_channels": 1,
-            "channels": [16, 32, 64],
-            "kernel_size": 3,
-            "padding": 1,
-            "pool_kernel_size": 2,
-            "use_batch_norm": True,
-            "dropout": 0.0,
-        },
-    },
-    "loss": {
-        "name": "CrossEntropyLoss",
-        "params": {},
-    },
-    "optimizer": {
-        "name": "AdamW",
-        "params": {
-            "lr": 1e-3,
-        },
-    },
-    "transforms": {
-        "resize": True,
-        "spatial_size": [96, 128, 96],
-        "resize_mode": "trilinear",
-        "scale_intensity": False,
-        "normalize_intensity": True,
-        "normalize_nonzero": True,
-        "normalize_channel_wise": True,
-        "rand_rotate90": False,
-        "rand_rotate90_prob": 0.5,
-        "rand_rotate90_spatial_axes": [0, 2],
-    },
-    "split": {
-        "train_size": 0.70,
-        "val_size": 0.15,
-        "test_size": 0.15,
-        "random_seed": None,
-    },
-    "dataloader": {
-        "batch_size": 2,
-        "num_workers": 0,
-    },
-    "checkpoint": {
-        "dir": "checkpoints",
-        "save_last": True,
-        "save_best": True,
-        "best_filename": "best_epoch_{epoch:03d}.pth",
-        "last_filename": "last.pth",
-        "monitor": "val_loss",
-        "mode": "min",
-        "min_delta": 0.0,
-    },
-    "early_stopping": {
-        "enabled": False,
-        "patience": 5,
-    },
-}
-
-
 def deep_update(base: dict, updates: dict):
     merged = copy.deepcopy(base)
     for key, value in updates.items():
@@ -96,14 +25,9 @@ def deep_update(base: dict, updates: dict):
     return merged
 
 
-def load_config(config_path: Path | None):
-    if config_path is None:
-        return copy.deepcopy(DEFAULT_CONFIG)
-
+def load_config(config_path: Path):
     with config_path.open() as f:
-        user_config = json.load(f)
-
-    return deep_update(DEFAULT_CONFIG, user_config)
+        return json.load(f)
 
 
 def set_nested(config: dict, dotted_key: str, value):
@@ -422,8 +346,8 @@ def main():
     parser.add_argument(
         "--config",
         type=Path,
-        default=None,
-        help="Path to a JSON config file. Defaults are used when omitted.",
+        required=True,
+        help="Path to a JSON config file.",
     )
     parser.add_argument(
         "--resume",
