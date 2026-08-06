@@ -2,21 +2,17 @@ import argparse
 import json
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 import wandb
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
 
 from datasets import build_test_loader
+from metrics import (
+    DEFAULT_THRESHOLD,
+    collect_predictions,
+    compute_metrics,
+    save_confusion_matrix_plot,
+)
 from models import build_model
 from train import build_loss
 
@@ -34,90 +30,11 @@ def load_checkpoint_and_metadata(checkpoint_path: Path):
     return checkpoint, metadata
 
 
-def evaluate(model, loss, test_loader, device: torch.device):
-    model.eval()
-    test_losses = []
-    y_true = []
-    y_pred = []
-    y_prob = []
-
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            outputs = model(images)
-            test_losses.append(loss(outputs, labels).item())
-
-            probs = torch.softmax(outputs, dim=1)[:, 1]
-            preds = outputs.argmax(dim=1)
-
-            y_true.extend(labels.cpu().tolist())
-            y_pred.extend(preds.cpu().tolist())
-            y_prob.extend(probs.cpu().tolist())
-
-    return {
-        "test_loss": sum(test_losses) / len(test_losses),
-        "y_true": y_true,
-        "y_pred": y_pred,
-        "y_prob": y_prob,
-    }
-
-
-def compute_metrics(results):
-    y_true = results["y_true"]
-    y_pred = results["y_pred"]
-    y_prob = results["y_prob"]
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
-    specificity = tn / (tn + fp) if (tn + fp) else 0.0
-
-    try:
-        auroc = roc_auc_score(y_true, y_prob)
-    except ValueError:
-        auroc = None
-
-    return {
-        "test_loss": results["test_loss"],
-        "accuracy": accuracy_score(y_true, y_pred),
-        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "sensitivity": recall_score(y_true, y_pred, zero_division=0),
-        "specificity": specificity,
-        "f1": f1_score(y_true, y_pred, zero_division=0),
-        "roc_auc": auroc,
-        "confusion_matrix": cm.tolist(),
-    }
-
-
 def save_outputs(output_dir: Path, metrics: dict, predictions: pd.DataFrame):
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "test_metrics.json").open("w") as f:
         json.dump(metrics, f, indent=2)
     predictions.to_csv(output_dir / "test_predictions.csv", index=False)
-
-
-def save_confusion_matrix_plot(confusion_matrix_values: list[list[int]], output_path: Path):
-    fig, ax = plt.subplots(figsize=(5, 4))
-    image = ax.imshow(confusion_matrix_values, cmap="Blues")
-    class_names = ["CDR 0", "CDR > 0"]
-
-    ax.set_xticks(range(len(class_names)), labels=class_names)
-    ax.set_yticks(range(len(class_names)), labels=class_names)
-    ax.set_xlabel("Predicted label")
-    ax.set_ylabel("True label")
-    ax.set_title("Test Confusion Matrix")
-
-    max_value = max(max(row) for row in confusion_matrix_values)
-    threshold = max_value / 2 if max_value else 0
-    for row_idx, row in enumerate(confusion_matrix_values):
-        for col_idx, value in enumerate(row):
-            color = "white" if value > threshold else "black"
-            ax.text(col_idx, row_idx, str(value), ha="center", va="center", color=color)
-
-    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160)
-    plt.close(fig)
 
 
 def log_to_wandb(metadata, config, metrics: dict):
@@ -143,6 +60,15 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log-wandb", action="store_true")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help=(
+            "Override the decision threshold. Defaults to the value tuned on validation "
+            f"and stored in the checkpoint, or {DEFAULT_THRESHOLD} if absent."
+        ),
+    )
     args = parser.parse_args()
 
     checkpoint, metadata = load_checkpoint_and_metadata(args.checkpoint)
@@ -159,16 +85,29 @@ def main():
     model.to(device)
     loss = build_loss(config)
 
-    results = evaluate(model, loss, test_loader, device)
-    metrics = compute_metrics(results)
+    if args.threshold is not None:
+        threshold = args.threshold
+    else:
+        threshold = checkpoint.get("threshold", DEFAULT_THRESHOLD)
+
+    results = collect_predictions(model, test_loader, loss, device)
+    metrics = compute_metrics(
+        y_true=results["y_true"],
+        y_prob=results["y_prob"],
+        threshold=threshold,
+        loss=results["loss"],
+    )
+    # Historical field name kept so old and new test_metrics.json stay comparable.
+    metrics["test_loss"] = metrics.pop("loss")
 
     output_dir = Path("evaluations") / metadata["run_id"]
     predictions = pd.DataFrame(
         {
             "image": [dataset_items[idx]["image"] for idx in test_idx],
             "label": results["y_true"],
-            "pred": results["y_pred"],
+            "pred": (results["y_prob"] >= threshold).astype(int),
             "prob_class_1": results["y_prob"],
+            "threshold": threshold,
         }
     )
     save_outputs(output_dir, metrics, predictions)
