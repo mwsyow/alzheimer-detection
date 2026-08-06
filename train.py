@@ -123,6 +123,12 @@ def set_nested(config: dict, dotted_key: str, value):
 def apply_sweep_overrides(config: dict, sweep_config) -> dict:
     config = deep_update({}, config)
     for key, value in dict(sweep_config).items():
+        if key.startswith("_"):
+            continue
+        if "." not in key and key in config and not isinstance(value, dict):
+            config[key] = value
+
+    for key, value in dict(sweep_config).items():
         if "." in key:
             set_nested(config, key, value)
     return config
