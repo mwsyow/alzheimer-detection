@@ -1,0 +1,92 @@
+# Example wandb sweep. Copy, edit, then:
+#   wandb sweep configs/example_sweep.yaml
+#   wandb agent <entity>/<project>/<sweep_id>
+#
+# YAML supports comments, so this file doubles as the reference for sweeps.
+# For the JSON config fields see configs/README.md.
+
+program: train.py
+entity: wmarcellius123
+project: alzheimer-detection
+
+# grid   - every combination; run count is the product of all `values` lists.
+# random - samples combinations until you stop the agent.
+# bayes  - models the objective; needs `metric` and works best with >20 runs.
+method: grid
+
+metric:
+  # MUST be "Best Validation <X>", not "Validation <X>".
+  #
+  # train.py calls define_metric(summary="max") on the per-epoch keys, which makes
+  # wandb store them as a nested {"max": ...} dict that metric.name cannot read.
+  # The "Best ..." keys are written as flat scalars precisely for this.
+  #
+  # The name must match checkpoint.monitor in the JSON config:
+  #   val_auc               -> Best Validation AUC                (goal: maximize)
+  #   val_balanced_accuracy -> Best Validation Balanced Accuracy  (goal: maximize)
+  #   val_f1                -> Best Validation F1                 (goal: maximize)
+  #   val_accuracy          -> Best Validation Accuracy           (goal: maximize)
+  #   val_loss              -> Best Validation Loss               (goal: minimize)
+  #
+  # Under cross-validation this is the MEAN across folds, written by the parent run.
+  name: Best Validation AUC
+  goal: maximize
+
+parameters:
+  # Dotted keys are written into the nested JSON config by apply_sweep_overrides,
+  # so `optimizer.params.lr` sets config["optimizer"]["params"]["lr"].
+  #
+  # `value` pins a constant; `values` defines a swept axis.
+
+  epochs:
+    value: 50
+
+  dataloader.batch_size:
+    value: 5
+
+  optimizer.params.lr:
+    values: [0.0001, 0.0003, 0.001]
+
+  # --- Simple3DCNN axes, matching the model in configs/example.json ---
+  #
+  # Model params are passed straight to the constructor, and Simple3DCNN has no
+  # allow-list, so an axis meant for the other model is a hard TypeError rather
+  # than a silent no-op. Keep these axes and the `command` config in sync.
+  model.params.dropout:
+    values: [0.0, 0.3]
+
+  # A list-valued parameter must be nested one level deeper under `values`,
+  # otherwise wandb reads the outer list as the set of options.
+  model.params.channels:
+    values:
+      - [16, 32]
+      - [16, 32, 64]
+      - [16, 32, 64, 128]
+
+  # --- DenseNet121 axes ---
+  # Swap `command` to a DenseNet config before enabling these.
+  # model.params.dropout_prob:
+  #   values: [0.0, 0.25]
+  #
+  # Only takes effect when model.pretrained.enabled is true AND
+  # model.pretrained.pretrained_weights_path resolves. Otherwise it is a silent no-op.
+  # model.pretrained.freeze_backbone:
+  #   values: [true, false]
+
+  # --- Cross-validation ---
+  # Enabling this multiplies runtime by n_splits and produces K+1 wandb runs per
+  # trial: one parent holding the objective, plus one child per fold. Children never
+  # write the objective key, so they cannot win sweep.best_run().
+  # cv.enabled:
+  #   value: true
+  # cv.n_splits:
+  #   value: 5
+
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - train.py
+  - --config
+  - configs/example.json

@@ -12,10 +12,8 @@ from torch import nn
 import wandb
 from datasets import (
     build_cv_split_indices,
-    build_dataset_items,
-    build_fold_loaders,
+    build_dataset_source,
     build_split_indices,
-    build_train_val_loaders,
     is_cv_enabled,
 )
 from metrics import (
@@ -521,7 +519,7 @@ def run_cross_validation(
     is_resume: bool = False,
 ):
     device = resolve_device(config)
-    dataset_items = build_dataset_items(config)
+    source = build_dataset_source(config)
     checkpoint_dir = get_checkpoint_dir(run, config)
 
     checkpoint_config = dict(config["checkpoint"])
@@ -534,7 +532,7 @@ def run_cross_validation(
     if is_resume:
         cv_state = metadata["cv"]
     else:
-        splits = build_cv_split_indices(dataset_items, config)
+        splits = build_cv_split_indices(source.items, config)
         cv_state = {
             "n_splits": config["cv"]["n_splits"],
             "group_id": wandb.util.generate_id(),
@@ -569,7 +567,7 @@ def run_cross_validation(
         cv_state["fold_run_ids"][fold_number] = child.id
         cv_state["current_fold"] = fold_number
 
-        train_loader, val_loader = build_fold_loaders(dataset_items, fold, config)
+        train_loader, val_loader = source.fold_loaders(fold)
         loss = build_loss(config)
         model = build_model(config).to(device)
         optim = build_optimizer(config, model)
@@ -644,13 +642,13 @@ def runner(
     is_resume = resume_checkpoint is not None
     device = resolve_device(config)
 
-    dataset_items = build_dataset_items(config)
+    source = build_dataset_source(config)
 
     checkpoint_dir = get_checkpoint_dir(run, config)
     if is_resume:
         split_indices = metadata["split"]
     else:
-        split_indices = build_split_indices(dataset_items, config)
+        split_indices = build_split_indices(source.items, config)
         save_metadata(
             checkpoint_dir=checkpoint_dir,
             run=run,
@@ -658,11 +656,7 @@ def runner(
             split_indices=split_indices,
         )
 
-    train_loader, val_loader = build_train_val_loaders(
-        dataset_items=dataset_items,
-        split_indices=split_indices,
-        config=config,
-    )
+    train_loader, val_loader = source.train_val_loaders(split_indices)
 
     loss = build_loss(config)
     model = build_model(config)

@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 import wandb
 
-from datasets import build_test_loader
+from datasets import build_dataset_source
 from metrics import (
     DEFAULT_THRESHOLD,
     aggregate_fold_metrics,
@@ -93,10 +93,10 @@ def evaluate_checkpoint(
     return metrics, results, threshold
 
 
-def build_predictions_frame(dataset_items, test_idx, results, threshold):
+def build_predictions_frame(source, test_idx, results, threshold):
     return pd.DataFrame(
         {
-            "image": [dataset_items[idx]["image"] for idx in test_idx],
+            "image": [source.item_id(idx) for idx in test_idx],
             "label": results["y_true"],
             "pred": (results["y_prob"] >= threshold).astype(int),
             "prob_class_1": results["y_prob"],
@@ -144,7 +144,8 @@ def evaluate_cv_run(run_dir: Path, args):
         )
 
     test_idx = resolve_test_idx(metadata)
-    test_loader, dataset_items = build_test_loader(config, test_idx)
+    source = build_dataset_source(config)
+    test_loader = source.test_loader(test_idx)
     output_root = Path("evaluations") / metadata["run_id"]
 
     fold_metrics = []
@@ -163,7 +164,7 @@ def evaluate_cv_run(run_dir: Path, args):
         save_outputs(
             fold_dir,
             metrics,
-            build_predictions_frame(dataset_items, test_idx, results, threshold),
+            build_predictions_frame(source, test_idx, results, threshold),
         )
         save_confusion_matrix_plot(
             confusion_matrix_values=metrics["confusion_matrix"],
@@ -196,7 +197,7 @@ def evaluate_cv_run(run_dir: Path, args):
         ensemble_metrics,
         pd.DataFrame(
             {
-                "image": [dataset_items[idx]["image"] for idx in test_idx],
+                "image": [source.item_id(idx) for idx in test_idx],
                 "label": y_true,
                 "pred": (ensemble_prob >= ensemble_threshold).astype(int),
                 "prob_class_1": ensemble_prob,
@@ -291,7 +292,8 @@ def main():
     config["device"] = str(device)
 
     test_idx = resolve_test_idx(metadata)
-    test_loader, dataset_items = build_test_loader(config, test_idx)
+    source = build_dataset_source(config)
+    test_loader = source.test_loader(test_idx)
 
     metrics, results, threshold = evaluate_checkpoint(
         checkpoint, config, test_loader, device, args.threshold
@@ -303,7 +305,7 @@ def main():
         metrics["fold"] = fold
         output_dir = output_dir / f"fold_{fold}"
 
-    predictions = build_predictions_frame(dataset_items, test_idx, results, threshold)
+    predictions = build_predictions_frame(source, test_idx, results, threshold)
     save_outputs(output_dir, metrics, predictions)
     save_confusion_matrix_plot(
         confusion_matrix_values=metrics["confusion_matrix"],

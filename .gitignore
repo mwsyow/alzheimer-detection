@@ -18,7 +18,14 @@ data/
 *.xlsx
 scripts/
 wandb/
-configs/
 checkpoints/
 evaluations/
 pretrained/
+
+# Keep personal configs local, but track the worked examples that document the
+# schema. This must be "configs/*" and not "configs/": git cannot re-include a file
+# once its parent directory itself is excluded.
+configs/*
+!configs/example.json
+!configs/example_sweep.yaml
+!configs/README.md
