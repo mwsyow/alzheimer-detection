@@ -14,7 +14,7 @@ from monai.transforms import (
     Resized,
     ScaleIntensityd,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import Subset
 
 
@@ -94,6 +94,81 @@ def build_split_indices(dataset_items: list[dict], config: dict):
         "val_idx": val_idx,
         "test_idx": test_idx,
     }
+
+
+def is_cv_enabled(config: dict) -> bool:
+    """Cross-validation is switched on by the presence of a "cv" block.
+
+    An explicit "enabled": false turns it off without having to delete the block.
+    """
+    cv_config = config.get("cv")
+    if not cv_config:
+        return False
+    return bool(cv_config.get("enabled", True))
+
+
+def build_cv_split_indices(dataset_items: list[dict], config: dict):
+    """Hold the test set out once, then stratified K-fold over everything else.
+
+    The test set comes from the same stratified_three_way_split used by the
+    single-split path, so it is identical to the one every non-CV run has used and
+    results stay directly comparable. The train and val halves are pooled and refolded.
+    """
+    cv_config = config["cv"]
+    split_config = config["split"]
+
+    train_idx, val_idx, test_idx = stratified_three_way_split(
+        dataset_items=dataset_items,
+        train_size=split_config["train_size"],
+        val_size=split_config["val_size"],
+        test_size=split_config["test_size"],
+        random_seed=split_config["random_seed"],
+    )
+
+    pool_idx = sorted(train_idx + val_idx)
+    pool_labels = [dataset_items[idx]["label"] for idx in pool_idx]
+
+    n_splits = cv_config["n_splits"]
+    if n_splits < 2:
+        raise ValueError(f"cv.n_splits must be at least 2, got {n_splits}")
+
+    shuffle = cv_config.get("shuffle", True)
+    random_seed = cv_config.get("random_seed", split_config["random_seed"])
+    splitter = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=shuffle,
+        # scikit-learn rejects a random_state when shuffle is off.
+        random_state=random_seed if shuffle else None,
+    )
+
+    folds = [
+        {
+            "train_idx": [pool_idx[i] for i in fold_train],
+            "val_idx": [pool_idx[i] for i in fold_val],
+        }
+        for fold_train, fold_val in splitter.split(pool_idx, pool_labels)
+    ]
+
+    return {"test_idx": test_idx, "folds": folds}
+
+
+def build_fold_loaders(dataset_items: list[dict], fold: dict, config: dict):
+    """Train/val loaders for one CV fold, using the same loaders as the fixed split."""
+    train_loader = build_loader(
+        dataset_items=dataset_items,
+        indices=fold["train_idx"],
+        config=config,
+        mode="train",
+        shuffle=True,
+    )
+    val_loader = build_loader(
+        dataset_items=dataset_items,
+        indices=fold["val_idx"],
+        config=config,
+        mode="val",
+        shuffle=False,
+    )
+    return train_loader, val_loader
 
 
 def build_transforms(config: dict, mode: str):

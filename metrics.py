@@ -148,16 +148,20 @@ def compute_metrics(
         roc_auc = None
         average_precision = None
 
+    # Every scalar is cast to a plain float: sklearn hands back numpy scalars, which
+    # torch.load rejects under its weights_only default when they reach metadata.pth.
     metrics = {
         "threshold": float(threshold),
-        "roc_auc": roc_auc,
-        "average_precision": average_precision,
-        "accuracy": accuracy_score(y_true, y_pred),
-        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "sensitivity": recall_score(y_true, y_pred, zero_division=0),
-        "specificity": specificity,
-        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "roc_auc": None if roc_auc is None else float(roc_auc),
+        "average_precision": (
+            None if average_precision is None else float(average_precision)
+        ),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "sensitivity": float(recall_score(y_true, y_pred, zero_division=0)),
+        "specificity": float(specificity),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
         "confusion_matrix": cm.tolist(),
         "predicted_positive_rate": float(y_pred.mean()),
         "prob_mean": float(y_prob.mean()),
@@ -166,6 +170,41 @@ def compute_metrics(
     if loss is not None:
         metrics["loss"] = float(loss)
     return metrics
+
+
+def aggregate_fold_metrics(fold_metrics: list[dict]):
+    """Mean and sample std across CV folds for every scalar metric.
+
+    Non-scalar entries (the confusion matrix) and metrics that came back None for any
+    fold are skipped; confusion matrices are summed instead.
+    """
+    if not fold_metrics:
+        return {"n_folds": 0, "mean": {}, "std": {}}
+
+    scalar_keys = [
+        key
+        for key in fold_metrics[0]
+        if key != "confusion_matrix"
+        and all(isinstance(m.get(key), (int, float)) for m in fold_metrics)
+    ]
+
+    mean = {}
+    std = {}
+    for key in scalar_keys:
+        values = [float(m[key]) for m in fold_metrics]
+        mean[key] = float(np.mean(values))
+        # Ddof=1: these folds are a sample, and it is the spread we report as +/-.
+        std[key] = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+
+    aggregate = {"n_folds": len(fold_metrics), "mean": mean, "std": std}
+
+    matrices = [m.get("confusion_matrix") for m in fold_metrics]
+    if all(m is not None for m in matrices):
+        aggregate["confusion_matrix_total"] = np.sum(
+            np.array(matrices), axis=0
+        ).tolist()
+
+    return aggregate
 
 
 def to_wandb_logs(metrics: dict, prefix: str, keys=VALIDATION_LOG_METRICS):
