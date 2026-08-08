@@ -23,6 +23,7 @@ from metrics import (
     aggregate_fold_metrics,
     collect_predictions,
     compute_metrics,
+    pack_predictions,
     select_threshold,
     summarize_predictions,
     to_wandb_logs,
@@ -158,6 +159,7 @@ def save_checkpoint(
     monitor_name: str,
     monitor_value: float,
     fold: int = None,
+    val_predictions: dict = None,
 ):
     torch.save(
         {
@@ -174,6 +176,11 @@ def save_checkpoint(
             # None for single-split runs; the 1-based fold index under CV, so a
             # checkpoint is self-describing even away from its metadata.
             "fold": fold,
+            # This epoch's validation predictions, packed as tensors. The threshold above
+            # is a derived scalar: stored alone it freezes the operating point, whereas
+            # these let evaluate.py choose one across all folds afterwards, or re-choose
+            # it under a different strategy without retraining.
+            "val_predictions": val_predictions,
         },
         checkpoint_path,
     )
@@ -311,6 +318,9 @@ def train(
             "monitor_name": monitor_name,
             "monitor_value": monitor_value,
             "fold": fold,
+            "val_predictions": pack_predictions(
+                val_results["y_true"], val_results["y_prob"]
+            ),
         }
 
         if (
@@ -547,6 +557,11 @@ def run_cross_validation(
         save_cv_metadata(checkpoint_dir, run, config, cv_state)
 
     run.summary["CV Folds"] = len(cv_state["folds"])
+    # The "Fold ..." series is a chart across folds, not a run-level result. Without this
+    # wandb would summarise each of them with its last logged value, putting the final
+    # fold's numbers in the summary where they read as the run's -- next to the CV Mean
+    # keys, which are what the run actually scored.
+    run.define_metric("Fold*", summary="none")
 
     for fold_number, fold in enumerate(cv_state["folds"], start=1):
         if fold_number in cv_state["completed_folds"]:
