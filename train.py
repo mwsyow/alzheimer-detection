@@ -450,23 +450,31 @@ def start_fold_run(
     if fold_checkpoint is not None and stored_id:
         resume_kwargs = {"id": stored_id, "resume": "must"}
     else:
-        # Under a sweep the agent exports WANDB_RUN_ID for the trial, and wandb.init
-        # falls back to it when no id is given -- so every fold would try to claim the
-        # parent's id and fail with "run ID <parent> is in use". An explicit fresh id
-        # shadows the environment.
         resume_kwargs = {"id": wandb.util.generate_id()}
 
-    return wandb.init(
-        entity=config["wandb_entity"],
-        project=config["wandb_project"],
-        name=f"{parent.name}-fold{fold_number}",
-        group=cv_state["group_id"],
-        job_type="fold",
-        mode=config["wandb_mode"],
-        config={**dict(config), "fold": fold_number},
-        reinit="create_new",
-        **resume_kwargs,
-    )
+    # While wandb's global settings carry a sweep_id, init strips project, entity
+    # and run_id from every call -- "Ignoring run_id ... when running a sweep" --
+    # so the child falls back to the trial's own id and dies with "run ID <parent>
+    # is in use". A fold is not a sweep trial in its own right, and the parent is
+    # already registered with the sweep, so clear the flag just long enough to
+    # create the child.
+    library = wandb.setup()
+    sweep_id = library.settings.sweep_id
+    library.settings.sweep_id = None
+    try:
+        return wandb.init(
+            entity=config["wandb_entity"],
+            project=config["wandb_project"],
+            name=f"{parent.name}-fold{fold_number}",
+            group=cv_state["group_id"],
+            job_type="fold",
+            mode=config["wandb_mode"],
+            config={**dict(config), "fold": fold_number},
+            reinit="create_new",
+            **resume_kwargs,
+        )
+    finally:
+        library.settings.sweep_id = sweep_id
 
 
 def log_fold_summary(parent: wandb.Run, fold_number: int, result: dict):
