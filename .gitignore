@@ -29,3 +29,7 @@ configs/*
 !configs/example.json
 !configs/example_sweep.yaml
 !configs/README.md
+
+condor/*
+!condor/README.md
+!condor/sync_to_hpc.sh
