@@ -447,9 +447,14 @@ def start_fold_run(
 ):
     """A grouped child run for one fold, resuming the previous one if interrupted."""
     stored_id = cv_state.get("fold_run_ids", {}).get(fold_number)
-    resume_kwargs = {}
     if fold_checkpoint is not None and stored_id:
         resume_kwargs = {"id": stored_id, "resume": "must"}
+    else:
+        # Under a sweep the agent exports WANDB_RUN_ID for the trial, and wandb.init
+        # falls back to it when no id is given -- so every fold would try to claim the
+        # parent's id and fail with "run ID <parent> is in use". An explicit fresh id
+        # shadows the environment.
+        resume_kwargs = {"id": wandb.util.generate_id()}
 
     return wandb.init(
         entity=config["wandb_entity"],
