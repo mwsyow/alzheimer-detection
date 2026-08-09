@@ -8,6 +8,8 @@ there. Source for the cluster facts below: `data/CS_HPC_Docu.pdf`.
 | `sync_to_hpc.sh` | Push everything git can't carry (data, `.env`, configs, weights) |
 | `check_internet.sub` | Submit file for the worker-node connectivity probe |
 | `check_internet.sh` | The probe itself — runs inside the container, not directly |
+| `sweep_agent.sub` | Submit file for wandb sweep agents |
+| `sweep_agent.sh` | Agent wrapper — runs inside the container, not directly |
 
 ## Prerequisites
 
@@ -136,6 +138,58 @@ Delete the throwaway `hpc-connectivity-check` run from the wandb project afterwa
 
 ---
 
+## `sweep_agent.sub` — running a wandb sweep
+
+Create the sweep on the submit node, then queue agents against its id:
+
+```bash
+mkdir -p condor/logs                                  # once; Condor won't create it
+uv run wandb sweep configs/resnet10_sweep.yaml        # prints <entity>/<project>/<id>
+condor_submit sweep_id=<entity>/<project>/<id> condor/sweep_agent.sub
+```
+
+Each queued agent pulls trials until the sweep is exhausted, so `queue 4` means
+four trials run concurrently. Override without editing the file:
+
+```bash
+condor_submit -queue 2 sweep_id=<...> condor/sweep_agent.sub
+```
+
+`initialdir` uses `$ENV(HOME)`, so the file needs no per-user editing.
+
+`sweep_agent.sh` runs inside the container and: `cd`s to the repo on NFS, sources
+`.env` for `WANDB_API_KEY`, installs `uv` to `/tmp/pytools` (no root, so
+`--target` is required), syncs the locked environment into `/tmp/venv`, prints
+whether CUDA is visible, then execs `wandb agent`. The venv and uv cache live on
+node-local `/tmp` so parallel agents can't race each other over NFS.
+
+Each agent re-downloads torch, costing a few minutes of startup. That's the price
+of not maintaining a custom image; if it becomes annoying, build one per
+<https://wiki.cs.uni-saarland.de/en/HPC/dependency-management>.
+
+### The sweep configs
+
+`configs/resnet10_sweep.yaml` and `configs/efficientnet_b0_sweep.yaml` both target
+the overfitting seen in the 5-fold baselines (train AUC 1.000/0.993 against val
+0.792/0.735). 16 grid trials each; with `cv.enabled` that's 80 child runs plus 16
+parents per sweep.
+
+**`build_model` passes `model.params` straight to the constructor.** The per-model
+allow-lists were removed, so a misnamed axis is now a `TypeError` at build time
+rather than a silent no-op that burns a full 5-fold run. Consequences:
+
+- **Neither model has a dropout axis.** MONAI's `ResNet` takes no dropout
+  argument, and `EfficientNetBN` takes none either — it reads a fixed 0.2 from its
+  per-variant params table. Since `model.params` is forwarded verbatim, `dropout`
+  and `dropout_rate` are `TypeError`s, not options.
+- `model.params.widen_factor` (ResNet only) is the one true capacity axis:
+  `0.5` gives 3.60M params against 14.36M at `1.0`, verified by construction.
+- EfficientNetB0 has no capacity axis at all; `transforms.spatial_size` stands in.
+
+Both sweeps are gitignored (`configs/*`), so `sync_to_hpc.sh` carries them, not git.
+
+---
+
 ## Writing your own submit files
 
 Every job **must** use the docker universe; anything else never matches a worker.
@@ -162,9 +216,12 @@ queue
 
 Things that bite:
 
-- **Set `initialdir`** to the repo root for training jobs. The configs use relative
-  paths (`"image_glob": "data/T88_111_masked/*masked_gfc.img"`), so without it the
-  glob silently matches zero files.
+- **`cd` to the repo inside your wrapper script.** In the docker universe the
+  container starts in the job's scratch dir, *not* `initialdir`, so the configs'
+  relative paths (`"image_glob": "data/T88_111_masked/*masked_gfc.img"`) resolve
+  against the wrong directory and the glob silently matches zero files.
+  `initialdir` still matters, but for the submit side: where a relative
+  `executable` is found and where `output`/`error`/`log` land.
 - **Relative vs absolute `executable`.** Relative is copied by Condor to the job
   scratch dir; absolute is interpreted as a path *inside* the container.
 - **No root inside the container.** Jobs run as your user, so `pip install` needs

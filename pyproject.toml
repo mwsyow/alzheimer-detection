@@ -12,7 +12,22 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "wandb>=0.28.1",
     "medmnist>=3.0.2",
+    "torch==2.9.1",
+    "torchvision==0.24.1",
 ]
+
+# The SIC cluster runs NVIDIA driver 550.163.01 (CUDA 12.4). PyPI's default torch
+# is a CUDA 13 build, which refuses to initialise against a 12.x driver -- a major
+# version gap has no compatibility path. cu126 is the newest CUDA 12 build with
+# cp314 wheels, and CUDA minor version compatibility covers 12.6 -> 12.4.
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 [dependency-groups]
 dev = [

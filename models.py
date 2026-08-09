@@ -144,23 +144,12 @@ def build_model(config):
     model_name = model_config["name"]
     params = dict(model_config.get("params", {}))
 
+    # Params are passed straight to the constructor -- no allow-list. A key the
+    # model does not accept is a TypeError at build time rather than a silent
+    # no-op that costs a full run to discover.
     if model_name == "Simple3DCNN":
         model = Simple3DCNN(**params)
     elif model_name == "DenseNet121":
-        allowed_params = {
-            "spatial_dims",
-            "in_channels",
-            "out_channels",
-            "num_classes",
-            "init_features",
-            "growth_rate",
-            "block_config",
-            "bn_size",
-            "act",
-            "norm",
-            "dropout_prob",
-        }
-        params = {key: value for key, value in params.items() if key in allowed_params}
         spatial_dims = params.pop("spatial_dims", 3)
         in_channels = params.pop("in_channels", 1)
         out_channels = params.pop("out_channels", params.pop("num_classes", 2))
@@ -171,23 +160,6 @@ def build_model(config):
             **params,
         )
     elif model_name == "ResNet10":
-        allowed_params = {
-            "spatial_dims",
-            "in_channels",
-            "n_input_channels",
-            "num_classes",
-            "out_channels",
-            "conv1_t_size",
-            "conv1_t_stride",
-            "no_max_pool",
-            "shortcut_type",
-            "widen_factor",
-            "feed_forward",
-            "bias_downsample",
-            "act",
-            "norm",
-        }
-        params = {key: value for key, value in params.items() if key in allowed_params}
         spatial_dims = params.pop("spatial_dims", 3)
         # in_channels for parity with the other models; MONAI's ResNet spells it
         # n_input_channels.
@@ -200,16 +172,6 @@ def build_model(config):
             **params,
         )
     elif model_name == "EfficientNetB0":
-        allowed_params = {
-            "spatial_dims",
-            "in_channels",
-            "num_classes",
-            "out_channels",
-            "model_name",
-            "norm",
-            "adv_prop",
-        }
-        params = {key: value for key, value in params.items() if key in allowed_params}
         spatial_dims = params.pop("spatial_dims", 3)
         in_channels = params.pop("in_channels", 1)
         num_classes = params.pop("num_classes", params.pop("out_channels", 2))
