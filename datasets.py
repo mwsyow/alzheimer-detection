@@ -10,7 +10,13 @@ from monai.transforms import (
     EnsureTyped,
     LoadImaged,
     NormalizeIntensityd,
+    RandAffined,
+    RandBiasFieldd,
+    RandFlipd,
+    RandGaussianNoised,
     RandRotate90d,
+    RandScaleIntensityd,
+    RandShiftIntensityd,
     Resized,
     ScaleIntensityd,
 )
@@ -325,8 +331,83 @@ def build_cv_split_indices(dataset_items: list[dict], config: dict):
     return {"test_idx": test_idx, "folds": folds}
 
 
+# Every key build_transforms reads. A "transforms" block naming anything else is a
+# typo, and unlike model.params -- which reaches a constructor and raises TypeError --
+# an unrecognised transform key would otherwise be a silent no-op: the sweep runs to
+# completion and every trial is identical, with nothing in the logs saying why.
+KNOWN_TRANSFORM_KEYS = frozenset(
+    {
+        "resize",
+        "spatial_size",
+        "resize_mode",
+        "scale_intensity",
+        "normalize_intensity",
+        "normalize_nonzero",
+        "normalize_channel_wise",
+        "rand_flip",
+        "rand_flip_prob",
+        "rand_flip_spatial_axis",
+        "rand_affine",
+        "rand_affine_prob",
+        "rand_affine_rotate_range",
+        "rand_affine_scale_range",
+        "rand_affine_translate_range",
+        "rand_affine_mode",
+        "rand_affine_padding_mode",
+        "rand_rotate90",
+        "rand_rotate90_prob",
+        "rand_rotate90_spatial_axes",
+        "rand_bias_field",
+        "rand_bias_field_prob",
+        "rand_bias_field_degree",
+        "rand_bias_field_coeff_range",
+        "rand_gaussian_noise",
+        "rand_gaussian_noise_prob",
+        "rand_gaussian_noise_std",
+        "rand_scale_intensity",
+        "rand_scale_intensity_prob",
+        "rand_scale_intensity_factors",
+        "rand_shift_intensity",
+        "rand_shift_intensity_prob",
+        "rand_shift_intensity_offsets",
+    }
+)
+
+
+def validate_transform_config(transform_config: dict) -> None:
+    unknown = sorted(set(transform_config) - KNOWN_TRANSFORM_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown transforms key(s): {', '.join(unknown)}. "
+            f"Known keys: {', '.join(sorted(KNOWN_TRANSFORM_KEYS))}"
+        )
+
+
 def build_transforms(backend: DatasetBackend, config: dict, mode: str):
+    """The transform pipeline for one mode. Augmentation is train-only.
+
+    Ordering is not cosmetic. Spatial augmentation runs before intensity handling, so
+    normalisation sees the volume the network will actually be given. RandBiasFieldd
+    sits *before* normalisation because it models a multiplicative scanner
+    inhomogeneity on raw intensities; the noise/scale/shift group sits *after*, because
+    their magnitudes are only meaningful relative to unit variance.
+
+    RandRotate90d moved from the end of the pipeline into the spatial group. That is a
+    no-op for existing configs: a 90-degree rotation permutes voxels, so the nonzero
+    set NormalizeIntensityd reduces over is unchanged, and normalisation commutes with
+    it exactly. Everything else here defaults to off, so a config that predates these
+    keys builds the pipeline it always did.
+    """
     transform_config = config["transforms"]
+    validate_transform_config(transform_config)
+    augment = mode == "train"
+
+    def enabled(key: str) -> bool:
+        return augment and transform_config.get(key, False)
+
+    def setting(key: str, default):
+        return transform_config.get(key, default)
+
     # The backend contributes whatever it takes to materialise "image"; everything
     # after that is shared and config-driven.
     transforms = list(backend.load_transforms())
@@ -339,6 +420,58 @@ def build_transforms(backend: DatasetBackend, config: dict, mode: str):
                 mode=transform_config.get("resize_mode", "trilinear"),
             )
         )
+
+    # --- spatial augmentation -------------------------------------------------
+    if enabled("rand_flip"):
+        # Left-right on the T88 sagittal axis. Anatomically valid for a roughly
+        # symmetric brain, and the cheapest way to double 159 training volumes.
+        transforms.append(
+            RandFlipd(
+                keys=["image"],
+                prob=setting("rand_flip_prob", 0.5),
+                spatial_axis=setting("rand_flip_spatial_axis", 0),
+            )
+        )
+    if enabled("rand_affine"):
+        # Small rigid-plus-scale jitter, the realistic replacement for rand_rotate90.
+        # rotate_range is radians per axis; 0.175 rad is 10 degrees. padding_mode
+        # "zeros" pairs with NormalizeIntensityd(nonzero=True), which ignores the
+        # padding rather than letting it drag the mean down.
+        transforms.append(
+            RandAffined(
+                keys=["image"],
+                prob=setting("rand_affine_prob", 0.5),
+                rotate_range=setting("rand_affine_rotate_range", [0.175, 0.175, 0.175]),
+                scale_range=setting("rand_affine_scale_range", [0.1, 0.1, 0.1]),
+                translate_range=setting("rand_affine_translate_range", [5, 5, 5]),
+                mode=setting("rand_affine_mode", "bilinear"),
+                padding_mode=setting("rand_affine_padding_mode", "zeros"),
+            )
+        )
+    if enabled("rand_rotate90"):
+        # 90-degree rotations are anatomically implausible for registered T88 brains.
+        # Kept because it is what the round-1 sweeps measured, not because it is right.
+        transforms.append(
+            RandRotate90d(
+                keys=["image"],
+                prob=setting("rand_rotate90_prob", 0.5),
+                spatial_axes=tuple(setting("rand_rotate90_spatial_axes", [0, 2])),
+            )
+        )
+
+    # --- intensity augmentation, before normalisation -------------------------
+    if enabled("rand_bias_field"):
+        # Smooth multiplicative field: the MRI-specific nuisance variable, and the
+        # augmentation with the most defensible prior for this modality.
+        transforms.append(
+            RandBiasFieldd(
+                keys=["image"],
+                prob=setting("rand_bias_field_prob", 0.5),
+                degree=setting("rand_bias_field_degree", 3),
+                coeff_range=tuple(setting("rand_bias_field_coeff_range", [0.0, 0.1])),
+            )
+        )
+
     if transform_config.get("scale_intensity", False):
         transforms.append(ScaleIntensityd(keys=["image"]))
     if transform_config.get("normalize_intensity", False):
@@ -349,16 +482,33 @@ def build_transforms(backend: DatasetBackend, config: dict, mode: str):
                 channel_wise=transform_config.get("normalize_channel_wise", True),
             )
         )
-    if mode == "train" and transform_config.get("rand_rotate90", False):
+
+    # --- intensity augmentation, after normalisation --------------------------
+    if enabled("rand_gaussian_noise"):
         transforms.append(
-            RandRotate90d(
+            RandGaussianNoised(
                 keys=["image"],
-                prob=transform_config.get("rand_rotate90_prob", 0.5),
-                spatial_axes=tuple(
-                    transform_config.get("rand_rotate90_spatial_axes", [0, 2])
-                ),
+                prob=setting("rand_gaussian_noise_prob", 0.5),
+                std=setting("rand_gaussian_noise_std", 0.1),
             )
         )
+    if enabled("rand_scale_intensity"):
+        transforms.append(
+            RandScaleIntensityd(
+                keys=["image"],
+                prob=setting("rand_scale_intensity_prob", 0.5),
+                factors=setting("rand_scale_intensity_factors", 0.1),
+            )
+        )
+    if enabled("rand_shift_intensity"):
+        transforms.append(
+            RandShiftIntensityd(
+                keys=["image"],
+                prob=setting("rand_shift_intensity_prob", 0.5),
+                offsets=setting("rand_shift_intensity_offsets", 0.1),
+            )
+        )
+
     transforms.extend(
         [
             EnsureTyped(keys=["image"], dtype=torch.float32),
