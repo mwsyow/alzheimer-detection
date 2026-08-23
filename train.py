@@ -408,7 +408,14 @@ def build_optimizer(config, model):
     optimizer_config = config["optimizer"]
     if optimizer_config["name"] != "AdamW":
         raise ValueError(f"Unsupported optimizer: {optimizer_config['name']}")
-    return torch.optim.AdamW(model.parameters(), **optimizer_config.get("params", {}))
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("Model has no trainable parameters")
+    return torch.optim.AdamW(
+        trainable_parameters, **optimizer_config.get("params", {})
+    )
 
 
 def resolve_device(config) -> torch.device:
@@ -597,7 +604,9 @@ def run_cross_validation(
 
         train_loader, val_loader = source.fold_loaders(fold)
         loss = build_loss(config)
-        model = build_model(config).to(device)
+        model = build_model(
+            config, initialize_pretrained=fold_checkpoint is None
+        ).to(device)
         optim = build_optimizer(config, model)
 
         epochs = config["epochs"]
@@ -687,7 +696,7 @@ def runner(
     train_loader, val_loader = source.train_val_loaders(split_indices)
 
     loss = build_loss(config)
-    model = build_model(config)
+    model = build_model(config, initialize_pretrained=not is_resume)
     model.to(device)
     optim = build_optimizer(config, model)
     if is_resume:

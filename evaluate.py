@@ -166,7 +166,7 @@ def evaluate_checkpoint(
     threshold_override: float = None,
 ):
     """Run one model over the test set and score it at its stored threshold."""
-    model = build_model(config)
+    model = build_model(config, initialize_pretrained=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     loss = build_loss(config)

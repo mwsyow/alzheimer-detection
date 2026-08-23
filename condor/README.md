@@ -10,6 +10,10 @@ there. Source for the cluster facts below: `data/CS_HPC_Docu.pdf`.
 | `check_internet.sh` | The probe itself — runs inside the container, not directly |
 | `sweep_agent.sub` | Submit file for wandb sweep agents |
 | `sweep_agent.sh` | Agent wrapper — runs inside the container, not directly |
+| `evaluate.sub` | Submit file for evaluating a trained checkpoint |
+| `evaluate.sh` | Evaluation wrapper — runs inside the container, not directly |
+| `train.sub` | Submit file for a single training run (one config, no sweep) |
+| `train.sh` | Training wrapper — runs inside the container, not directly |
 
 ## Prerequisites
 
@@ -161,7 +165,10 @@ condor_submit -queue 2 sweep_id=<...> condor/sweep_agent.sub
 `.env` for `WANDB_API_KEY`, installs `uv` to `/tmp/pytools` (no root, so
 `--target` is required), syncs the locked environment into `/tmp/venv`, prints
 whether CUDA is visible, then execs `wandb agent`. The venv and uv cache live on
-node-local `/tmp` so parallel agents can't race each other over NFS.
+node-local `/tmp` so parallel agents can't race each other over NFS. Hugging Face
+uses the same policy: `HF_HOME` points to job-local scratch, so MedicalNet downloads
+once per agent job and is reused across that agent's trials and folds without touching
+the shared-home cache.
 
 Each agent re-downloads torch, costing a few minutes of startup. That's the price
 of not maintaining a custom image; if it becomes annoying, build one per
@@ -182,11 +189,69 @@ rather than a silent no-op that burns a full 5-fold run. Consequences:
   argument, and `EfficientNetBN` takes none either — it reads a fixed 0.2 from its
   per-variant params table. Since `model.params` is forwarded verbatim, `dropout`
   and `dropout_rate` are `TypeError`s, not options.
-- `model.params.widen_factor` (ResNet only) is the one true capacity axis:
-  `0.5` gives 3.60M params against 14.36M at `1.0`, verified by construction.
+- MedicalNet fixes ResNet10 at `widen_factor: 1.0`; smaller variants have
+  incompatible tensor shapes. Its sweep compares `freeze_backbone: true` against
+  full fine-tuning instead.
 - EfficientNetB0 has no capacity axis at all; `transforms.spatial_size` stands in.
 
 Both sweeps are gitignored (`configs/*`), so `sync_to_hpc.sh` carries them, not git.
+
+---
+
+## `evaluate.sub` — evaluating a checkpoint
+
+Whatever you put in `args` is forwarded to `evaluate.py` unchanged, so every flag
+it accepts works:
+
+```bash
+# a whole CV run: each fold, mean +/- std, plus the ensemble
+condor_submit args="--checkpoint checkpoints/<run_id> --config configs/resnet10.json" \
+    condor/evaluate.sub
+
+# one checkpoint file
+condor_submit args="--checkpoint checkpoints/<run_id>/split_1/last.pth" condor/evaluate.sub
+
+# also push the numbers to the run's wandb page
+condor_submit args="--checkpoint checkpoints/<run_id> --log-wandb" condor/evaluate.sub
+```
+
+Point `--checkpoint` at a *run directory* to get the fold-by-fold report plus the
+ensemble; point it at a single `.pth` for one model. Results are written to
+`evaluations/<run_id>/` on NFS, so they outlive the job — read them from the
+submit node afterwards.
+
+`--config` only supplies evaluation-time settings (threshold, evaluation, device,
+wandb, dataloader). Everything describing the trained model comes from the run's
+own metadata, so you cannot accidentally evaluate under a different architecture
+than was trained.
+
+Requests 1 GPU and 16G. Inference is lighter than training, but a CV evaluation
+still pushes the test set through K models.
+
+---
+
+## `train.sub` — a single training run
+
+For one configuration, where a sweep's parent/child bookkeeping is just noise.
+Whatever you put in `args` is forwarded to `train.py` unchanged:
+
+```bash
+# a 5-fold cross-validation run from a config
+condor_submit args="--config configs/efficientnet_b0_bnfix.json" condor/train.sub
+
+# pick up an interrupted CV run at the fold and epoch it stopped at
+condor_submit args="--config configs/efficientnet_b0_bnfix.json --resume checkpoints/<run_id>" \
+    condor/train.sub
+```
+
+Checkpoints land in `checkpoints/<run_id>/` on NFS, so they outlive the job.
+
+Use this rather than a one-trial sweep when the question is "does this single
+change work", since the answer is usually in the per-epoch validation curve of
+each fold rather than in the aggregate the sweep optimises.
+
+Requests the same 1 GPU / 24G as `sweep_agent.sub`: a CV run holds one model at a
+time, so the ceiling is set by the largest configuration, not the fold count.
 
 ---
 
@@ -230,6 +295,46 @@ Things that bite:
   other users. `/tmp` in the container is the job's scratch dir.
 - **`request_GPUs = 1`** even for non-GPU probes, if the answer should reflect
   where training actually runs — the cluster also has CPU-only AMD nodes.
+
+### GPU memory
+
+`request_memory` is **host RAM** and has no effect on VRAM, so it is not the knob for
+a CUDA OOM. Every submit file now carries a `gpu_mem` macro that filters which GPUs
+may match:
+
+```bash
+condor_submit gpu_mem=20000 args="--config configs/resnet10.json" condor/train.sub
+```
+
+Default is `0`, which matches any GPU. Measured peak allocation at 96×128×96,
+batch 8 — extrapolated from batch 1 and 2, then confirmed against the round-1 OOM
+message's own "9.31 GiB is allocated by PyTorch":
+
+| Config | Peak allocated | `gpu_mem` |
+| --- | --- | --- |
+| ResNet10 `widen_factor=0.25` | 2.4 G | default |
+| ResNet10 `widen_factor=0.5` | 4.7 G | default |
+| ResNet10 `widen_factor=1.0` | 9.3 G | `20000` |
+| EfficientNetB0 | 4.5 G | default |
+
+Add roughly 50% over the measured figure for fragmentation and the allocator's
+reserve. Both wrappers also export `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`:
+the round-1 OOM had only 9.31 GiB allocated but 14.03 GiB in use on a 15.89 GiB card,
+so 4.37 GiB was reserved-but-unallocated fragmentation, and this is the setting
+torch's own error message recommends for that gap. Between the two, the eight
+`widen_factor=1.0` trials that died should now fit.
+
+`require_gpus` needs HTCondor 9.9 or newer; the cluster runs 24.12.2 (checked
+2026-08-23), so it is the supported idiom here and the older
+`requirements = TARGET.CUDAGlobalMemoryMb >= N` form is not needed.
+
+Before relying on a `gpu_mem` value, check it is satisfiable — a filter no worker can
+meet leaves the job idle forever rather than failing:
+
+```bash
+condor_status -af Name GPUs_GlobalMemoryMb | sort -u -k2 -n
+condor_q -better <jobid>          # if it sits idle, this says which constraint bit
+```
 
 ### Storage
 

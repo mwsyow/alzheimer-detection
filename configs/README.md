@@ -86,26 +86,29 @@ so it is slower per step than 12.1M parameters suggests.
 
 ### `model.pretrained` (all three MONAI models)
 
+MedicalNet ResNet10 downloads directly from its public Hugging Face repository:
+
 ```json
 "pretrained": {
   "enabled": true,
-  "pretrained_weights_path": "pretrained/DenseNet121/86_acc_model.pth",
+  "source": "medicalnet",
   "freeze_backbone": false
 }
 ```
 
-Sits **beside** `params`, not inside it. Weights load with a shape filter, so a
-mismatched classifier head is skipped and randomly initialised — that is what lets the
-3-class rootstrap checkpoint feed a 2-class model.
+The Hub checkpoint is pinned to an immutable revision and verified by SHA-256. Its
+72 backbone tensors must match exactly; the original release has no classifier, so the
+project's two-class `fc` layer remains newly initialised. MedicalNet requires a 3D,
+one-channel ResNet10 with shortcut B, `widen_factor: 1.0`, and bias-free downsampling;
+incompatible parameters fail before downloading.
 
-`freeze_backbone: true` leaves only the final linear layer trainable — 2,050 of 11.2M
-parameters for DenseNet121, 1,026 for ResNet10, 3,074 for EfficientNet-B3. Both
-`pretrained` keys must be set or `freeze_backbone` does nothing.
+`freeze_backbone: true` trains only the new classifier and keeps the frozen backbone,
+including BatchNorm, in evaluation mode. `false` fine-tunes the whole network. Resume
+and evaluation reconstruct the architecture without downloading pretrained weights.
 
-No pretrained checkpoint ships for ResNet10 or EfficientNet-B3, so
-`configs/resnet10.json` and `configs/efficientnet_b3.json` set `enabled: false`; the
-block is there for when you have weights. MONAI's own MedicalNet ResNet and ImageNet
-EfficientNet downloads are deliberately not wired up — the latter is 2D only.
+Other MONAI models retain the local-checkpoint form using
+`pretrained_weights_path`. Their compatible tensors are shape-filtered and a mismatched
+classifier is skipped. Pretraining options sit beside `params`, not inside it.
 
 ## `loss` / `optimizer`
 
