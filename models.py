@@ -9,7 +9,6 @@ from monai.networks.nets import ResNet as BaseResNet
 from monai.networks.nets.resnet import ResNetBlock, get_inplanes
 from torch import nn
 
-
 MEDICALNET_RESNET10_REPO = "TencentMedicalNet/MedicalNet-Resnet10"
 MEDICALNET_RESNET10_FILENAME = "resnet_10_23dataset.pth"
 MEDICALNET_RESNET10_REVISION = "2a0c8cd91b82beb69610b60cb76d9eb8cbf9eac7"
@@ -72,7 +71,9 @@ class PretrainedMixin(nn.Module):
                 "state_dict", state_dict.get("model_state_dict", state_dict)
             )
         if not isinstance(state_dict, Mapping):
-            raise TypeError(f"Expected a state dict in {weights_path}, got {type(state_dict)}")
+            raise TypeError(
+                f"Expected a state dict in {weights_path}, got {type(state_dict)}"
+            )
         state_dict = {
             key.removeprefix("module."): value for key, value in state_dict.items()
         }
@@ -171,7 +172,10 @@ class ResNet10(BaseResNet, PretrainedMixin):
             )
 
         incompatible = self.load_state_dict(pretrained, strict=False)
-        if set(incompatible.missing_keys) != classifier_keys or incompatible.unexpected_keys:
+        if (
+            set(incompatible.missing_keys) != classifier_keys
+            or incompatible.unexpected_keys
+        ):
             raise RuntimeError(
                 "MedicalNet load did not leave exactly the classifier uninitialized: "
                 f"missing={incompatible.missing_keys}, "
@@ -256,44 +260,6 @@ class Simple3DCNN(nn.Module):
         return self.classifier(x)
 
 
-def _prepare_medicalnet_resnet10_params(params: dict) -> dict:
-    required = {
-        "spatial_dims": 3,
-        "n_input_channels": 1,
-        "shortcut_type": "B",
-        "widen_factor": 1.0,
-        "bias_downsample": False,
-        "conv1_t_size": 7,
-        "conv1_t_stride": 1,
-        "no_max_pool": False,
-        # The released checkpoint is a backbone only; keep MONAI's feed-forward
-        # path enabled so this project can attach its new two-class fc layer.
-        "feed_forward": True,
-    }
-    prepared = dict(params)
-    if "in_channels" in prepared:
-        in_channels = prepared.pop("in_channels")
-        if "n_input_channels" in prepared and prepared["n_input_channels"] != in_channels:
-            raise ValueError("in_channels and n_input_channels disagree")
-        prepared["n_input_channels"] = in_channels
-
-    incompatible = {
-        key: (prepared[key], expected)
-        for key, expected in required.items()
-        if key in prepared and prepared[key] != expected
-    }
-    if incompatible:
-        details = ", ".join(
-            f"{key}={actual!r} (required {expected!r})"
-            for key, (actual, expected) in incompatible.items()
-        )
-        raise ValueError(f"MedicalNet ResNet10 requires its original 3D architecture: {details}")
-
-    for key, value in required.items():
-        prepared.setdefault(key, value)
-    return prepared
-
-
 def build_model(config, initialize_pretrained: bool = True):
     model_config = config["model"]
     model_name = model_config["name"]
@@ -304,13 +270,14 @@ def build_model(config, initialize_pretrained: bool = True):
 
     if pretrained_enabled and pretrained_source == "medicalnet":
         if model_name != "ResNet10":
-            raise ValueError("pretrained.source='medicalnet' is supported only by ResNet10")
+            raise ValueError(
+                "pretrained.source='medicalnet' is supported only by ResNet10"
+            )
         if pretrained.get("pretrained_weights_path"):
             raise ValueError(
                 "MedicalNet is configured as a Hugging Face source; remove "
                 "pretrained_weights_path."
             )
-        params = _prepare_medicalnet_resnet10_params(params)
 
     # Params are passed straight to the constructor -- no allow-list. A key the
     # model does not accept is a TypeError at build time rather than a silent
@@ -352,7 +319,11 @@ def build_model(config, initialize_pretrained: bool = True):
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
-    if initialize_pretrained and pretrained_enabled and isinstance(model, PretrainedMixin):
+    if (
+        initialize_pretrained
+        and pretrained_enabled
+        and isinstance(model, PretrainedMixin)
+    ):
         pretrained_weights_path = pretrained.get("pretrained_weights_path")
         if pretrained_source == "medicalnet":
             model.load_medicalnet_weights()

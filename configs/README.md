@@ -98,9 +98,22 @@ MedicalNet ResNet10 downloads directly from its public Hugging Face repository:
 
 The Hub checkpoint is pinned to an immutable revision and verified by SHA-256. Its
 72 backbone tensors must match exactly; the original release has no classifier, so the
-project's two-class `fc` layer remains newly initialised. MedicalNet requires a 3D,
-one-channel ResNet10 with shortcut B, `widen_factor: 1.0`, and bias-free downsampling;
-incompatible parameters fail before downloading.
+project's two-class `fc` layer remains newly initialised.
+
+The architecture MedicalNet requires is **not** injected for you — `model.params`
+carries it, so the config and the logged run describe the same model, and every setting
+is available as a sweep axis. `configs/resnet10.json` is the worked example. A
+weight-bearing mismatch raises at load time rather than silently loading a partial
+backbone: `widen_factor`, `shortcut_type`, `bias_downsample`, `conv1_t_size` and
+`feed_forward` are all checked by name and shape.
+
+Two settings cannot be checked, because they change only the forward pass and carry no
+weights: `conv1_t_stride` and `no_max_pool`. A wrong value there loads cleanly and
+trains, so they are deliberate choices rather than pins. MedicalNet's own stem is
+stride 2, and `configs/resnet10.json` matches it — which also drops peak VRAM at
+batch 8 from 9.31 G to 1.44 G. Setting stride 1 doubles the spatial resolution reaching
+the classifier (6×8×6 rather than 3×4×3 before global pooling) at 6.5× the memory, and
+applies the pretrained filters at a scale they were not trained on.
 
 `freeze_backbone: true` trains only the new classifier and keeps the frozen backbone,
 including BatchNorm, in evaluation mode. `false` fine-tunes the whole network. Resume
