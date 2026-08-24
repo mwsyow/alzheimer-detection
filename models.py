@@ -5,6 +5,8 @@ from pathlib import Path
 import torch
 from monai.networks.nets import DenseNet121 as BaseDenseNet121
 from monai.networks.nets import EfficientNetBN as BaseEfficientNetBN
+from monai.networks.nets.efficientnet import EfficientNet as BaseEfficientNet
+from monai.networks.nets.efficientnet import efficientnet_params
 from monai.networks.nets import ResNet as BaseResNet
 from monai.networks.nets.resnet import ResNetBlock, get_inplanes
 from torch import nn
@@ -183,10 +185,33 @@ class ResNet10(BaseResNet, PretrainedMixin):
             )
 
 
-class EfficientNetB0(BaseEfficientNetBN, PretrainedMixin):
-    """MONAI EfficientNet-B3 at 12.1M parameters, the variant closest to
-    DenseNet121's 11.2M (B2 is 8.7M, B0 4.7M). Depth and resolution scaling make it
-    slower per step than the parameter count suggests."""
+# The EfficientNet-B block topology from the paper, identical for every B variant --
+# only the width/depth/resolution coefficients differ, and those come from MONAI's own
+# efficientnet_params table. MONAI hardcodes these strings inside EfficientNetBN's
+# __init__ rather than exposing them, so EfficientNet has to repeat them. Verified in
+# tests/test_efficientnet_dropout.py: building EfficientNet with these plus the table
+# values reproduces EfficientNetBN exactly for b0-b3 -- same state-dict keys, same
+# shapes, same per-block drop-connect schedule.
+EFFICIENTNET_BLOCKS_ARGS = [
+    "r1_k3_s11_e1_i32_o16_se0.25",
+    "r2_k3_s22_e6_i16_o24_se0.25",
+    "r2_k5_s22_e6_i24_o40_se0.25",
+    "r3_k3_s22_e6_i40_o80_se0.25",
+    "r3_k5_s11_e6_i80_o112_se0.25",
+    "r4_k5_s22_e6_i112_o192_se0.25",
+    "r1_k3_s11_e6_i192_o320_se0.25",
+]
+
+
+class EfficientNetBN(BaseEfficientNetBN, PretrainedMixin):
+    """MONAI's variant wrapper: pick a B number and go.
+
+    Use this when the B number is the only capacity knob you need. `norm` passes
+    through to all 49 normalisation layers, but dropout_rate and drop_connect_rate do
+    NOT -- EfficientNetBN reads them from the per-variant table and does not accept
+    them, so they stay at the table's values and never appear in the run config. Use
+    EfficientNet when those matter.
+    """
 
     classifier_path = "_fc"
 
@@ -208,6 +233,75 @@ class EfficientNetB0(BaseEfficientNetBN, PretrainedMixin):
             num_classes=num_classes,
             **kwargs,
         )
+
+
+class EfficientNet(BaseEfficientNet, PretrainedMixin):
+    """The full-control form: every regulariser and scaling coefficient is an argument.
+
+    Subclasses MONAI's EfficientNet rather than its EfficientNetBN wrapper, so
+    dropout_rate and drop_connect_rate are real constructor arguments instead of
+    table lookups. Both matter on this task: the network reaches train AUC 0.99+
+    against val 0.74, so it overfits, and stochastic depth over the MBConv blocks is a
+    strong regulariser at 159 training volumes.
+
+    width_coefficient and depth_coefficient are exposed for the same reason -- a
+    continuous capacity axis, finer than the B number, which only moves in the table's
+    steps and measured monotonically worse here.
+
+    model_name seeds the defaults from MONAI's table, and every other argument
+    defaults to None meaning "use that seed". So EfficientNet(model_name="...") with
+    nothing else builds exactly what EfficientNetBN would have built.
+    """
+
+    classifier_path = "_fc"
+
+    def __init__(
+        self,
+        spatial_dims: int = 3,
+        in_channels: int = 1,
+        num_classes: int = 2,
+        model_name: str = "efficientnet-b0",
+        dropout_rate: float | None = None,
+        drop_connect_rate: float | None = None,
+        width_coefficient: float | None = None,
+        depth_coefficient: float | None = None,
+        image_size: int | None = None,
+        blocks_args_str: list[str] | None = None,
+        **kwargs,
+    ):
+        if model_name not in efficientnet_params:
+            raise ValueError(
+                f"Unknown model_name {model_name!r}. "
+                f"Options: {sorted(efficientnet_params)}"
+            )
+        width, depth, size, dropout, drop_connect = efficientnet_params[model_name]
+
+        def pick(override, default):
+            return default if override is None else override
+
+        super().__init__(
+            blocks_args_str=blocks_args_str or EFFICIENTNET_BLOCKS_ARGS,
+            spatial_dims=spatial_dims,
+            in_channels=in_channels,
+            num_classes=num_classes,
+            width_coefficient=pick(width_coefficient, width),
+            depth_coefficient=pick(depth_coefficient, depth),
+            dropout_rate=pick(dropout_rate, dropout),
+            # The table's training resolution, used only for the static padding
+            # calculation. EfficientNetBN passes the same value, so this matches it.
+            image_size=pick(image_size, size),
+            drop_connect_rate=pick(drop_connect_rate, drop_connect),
+            **kwargs,
+        )
+
+
+class EfficientNetB0(EfficientNetBN):
+    """Kept so existing configs and checkpoint metadata keep resolving.
+
+    Every run before 2026-08-24 recorded model.name "EfficientNetB0", and evaluate.py
+    rebuilds the architecture from that metadata, so renaming it would make those
+    checkpoints unloadable. New configs should say "EfficientNetBN" or "EfficientNet".
+    """
 
 
 class Simple3DCNN(nn.Module):
@@ -306,11 +400,16 @@ def build_model(config, initialize_pretrained: bool = True):
             num_classes=num_classes,
             **params,
         )
-    elif model_name == "EfficientNetB0":
+    elif model_name in ("EfficientNet", "EfficientNetBN", "EfficientNetB0"):
         spatial_dims = params.pop("spatial_dims", 3)
         in_channels = params.pop("in_channels", 1)
         num_classes = params.pop("num_classes", params.pop("out_channels", 2))
-        model = EfficientNetB0(
+        efficientnet_class = {
+            "EfficientNet": EfficientNet,
+            "EfficientNetBN": EfficientNetBN,
+            "EfficientNetB0": EfficientNetB0,
+        }[model_name]
+        model = efficientnet_class(
             spatial_dims=spatial_dims,
             in_channels=in_channels,
             num_classes=num_classes,
