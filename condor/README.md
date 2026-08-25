@@ -156,8 +156,14 @@ Each queued agent pulls trials until the sweep is exhausted, so `queue 4` means
 four trials run concurrently. Override without editing the file:
 
 ```bash
-condor_submit -queue 2 sweep_id=<...> condor/sweep_agent.sub
+condor_submit n_agents=2 sweep_id=<...> condor/sweep_agent.sub
 ```
+
+Use the `n_agents` macro, **not** `condor_submit -queue N`. HTCondor's `-queue` takes a
+whole queue *statement*, which may contain spaces (`-queue 3 item in list`), so it has
+to be the last argument on the command line — `condor_submit -queue 1 sweep_id=... \
+condor/sweep_agent.sub` silently swallows the macro and the submit file into the queue
+statement. Macros are order-independent.
 
 `initialdir` uses `$ENV(HOME)`, so the file needs no per-user editing.
 
