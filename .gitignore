@@ -29,6 +29,11 @@ configs/*
 !configs/example.json
 !configs/example_sweep.yaml
 !configs/README.md
+# The benchmark configs ARE the audit trail for the architecture comparison: they
+# record the exact protocol every arm was evaluated under. checkpoints/ is gitignored
+# too, so without these the only surviving record is metadata.pth inside runs.
+!configs/bench_*.json
+!configs/bench_*_sweep.yaml
 
 condor/*
 !condor/README.md

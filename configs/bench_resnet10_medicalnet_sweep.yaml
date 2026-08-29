@@ -1,0 +1,55 @@
+# Benchmark arm: ResNet10 + MedicalNet pretrained, full fine-tune
+#
+# Part of the five-arm architecture comparison. Every arm shares an IDENTICAL evaluation
+# protocol -- 60 epochs, early stopping OFF, checkpoint.min_delta 0.0, batch 8,
+# 96x128x96, no augmentation, 5-fold CV with split.random_seed 42 -- and keeps only its
+# own tuned model hyperparameters. tests/test_benchmark_protocol.py asserts that the
+# protocol block is byte-identical across all five configs.
+#
+# This arm: identical architecture to the scratch arm; the ONLY difference is that the 72
+#   backbone tensors are loaded. Best measured: ls9ron63 0.8285 at lr 1e-4.
+#
+# EARLY STOPPING IS OFF ON PURPOSE. `Best Validation AUC` is a max over epochs, so an arm
+# that trains longer gets more draws from a noisy metric -- worth up to +0.056 at the
+# measured per-epoch noise. A fixed 60-epoch budget gives every arm the same number of
+# draws. 60 clears the slowest observed fold (EfficientNet peaked at epoch 41).
+#
+# THE ONLY AXIS IS THE SEED. The measured noise floor is 0.027 -- the effect of
+# cv.random_seed alone, nothing else changed -- so a single run per arm cannot rank
+# anything. Four seeds give SE ~0.015 per arm, resolving differences of ~0.035-0.045.
+# split.random_seed stays 42, so every arm sees identical fold partitions per seed: a
+# paired design, which roughly halves the error on arm-to-arm differences.
+#
+# Read the result as mean +/- SE across the 4 seeds, and as a PAIRED difference against
+# the Simple3DCNN baseline. Never use sweep.best_run() -- with a seed axis the argmax is
+# a max over seeds, i.e. pure selection bias.
+#
+#   wandb sweep configs/bench_resnet10_medicalnet_sweep.yaml
+#   condor_submit n_agents=2 sweep_id=<full entity/project/id> condor/sweep_agent.sub
+#
+# 4 trials, each 5 folds = 20 child runs plus 4 parents.
+
+program: train.py
+entity: wmarcellius123
+project: alzheimer-detection
+method: grid
+
+metric:
+  name: Best Validation AUC
+  goal: maximize
+
+parameters:
+  # The only axis. Repartitions the StratifiedKFold folds while leaving the held-out
+  # test split untouched.
+  cv.random_seed:
+    values: [42, 1337, 7, 2024]
+
+command:
+  - ${env}
+  - uv
+  - run
+  - --no-dev
+  - python
+  - train.py
+  - --config
+  - configs/bench_resnet10_medicalnet.json
