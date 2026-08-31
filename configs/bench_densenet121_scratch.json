@@ -4,29 +4,23 @@
   "wandb_entity": null,
   "wandb_project": "alzheimer-detection",
   "wandb_mode": "online",
-  "wandb_name": "bench-simple3dcnn-baseline",
+  "wandb_name": "bench-densenet121-scratch",
   "dataset": {
     "name": "oasis",
     "image_glob": "data/T88_111_masked/*masked_gfc.img",
     "label_path": "data/oasis_cross-sectional_cdr_cleaned.xlsx"
   },
   "model": {
-    "name": "Simple3DCNN",
+    "name": "DenseNet121",
     "params": {
       "num_classes": 2,
       "in_channels": 1,
-      "channels": [
-        4,
-        8,
-        16,
-        32,
-        64,
-        128
-      ],
-      "dropout": 0.0
+      "spatial_dims": 3
     },
     "pretrained": {
-      "enabled": false
+      "enabled": false,
+      "pretrained_weights_path": null,
+      "freeze_backbone": false
     }
   },
   "loss": {

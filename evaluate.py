@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import re
 from pathlib import Path
@@ -11,9 +12,10 @@ import wandb
 from datasets import build_dataset_source
 from metrics import (
     CV_THRESHOLD_STRATEGIES,
-    DEFAULT_CV_THRESHOLD_STRATEGY,
     DEFAULT_FPR_ROUNDING,
-    DEFAULT_THRESHOLD,
+    DEFAULT_NUM_THRESHOLDS,
+    DEFAULT_THRESHOLD_OBJECTIVE,
+    DEFAULT_THRESHOLD_TIE_BREAK,
     FPR_ROUNDING_POLICIES,
     WANDB_METRIC_LABELS,
     aggregate_fold_metrics,
@@ -31,6 +33,7 @@ from train import (
     find_metadata_path,
     load_config,
     load_metadata,
+    normalize_threshold_config,
 )
 
 # Evaluation may override only settings that cannot change what the model computes.
@@ -72,13 +75,12 @@ COMPARISON_METRICS = (
     "precision",
     "sensitivity",
     "specificity",
+    "npv",
+    "fpr",
     "loss",
     "threshold",
 )
-COMPARISON_LABELS = {
-    **WANDB_METRIC_LABELS,
-    "average_precision": "Average Precision",
-}
+COMPARISON_LABELS = WANDB_METRIC_LABELS
 COMPARISON_COLUMNS = ("Metric", "CV Validation", "Test Ensemble", "Test Mean")
 
 
@@ -129,7 +131,7 @@ def resolve_eval_config(metadata: dict, config_path: Path = None) -> tuple[dict,
     if config_path is None:
         return config, report
 
-    supplied = load_config(config_path)
+    supplied = load_config(config_path, normalize_threshold=False)
     overrides = {}
     for key, value in supplied.items():
         if key in EVAL_OVERRIDABLE_KEYS:
@@ -158,14 +160,36 @@ def discover_fold_checkpoints(run_dir: Path) -> dict[int, Path]:
     return found
 
 
+def stored_threshold(checkpoint: dict, checkpoint_path=None) -> float:
+    """The operating point a checkpoint recorded, or a clear failure.
+
+    Checkpoints written while training still tuned a threshold each epoch carry one.
+    Newer ones do not, because training now computes only threshold-free metrics and
+    the cut is chosen once at evaluation time. Falling back to 0.5 here reported an
+    arbitrary operating point as though it had been validated.
+    """
+    threshold = checkpoint.get("threshold")
+    if threshold is None:
+        where = f" in {checkpoint_path}" if checkpoint_path is not None else ""
+        raise ValueError(
+            f"No threshold stored{where}, because training no longer selects one. "
+            "Choose an operating point explicitly: --threshold <float> to pin one, "
+            "--threshold-from <cv_run_dir> to inherit the one that run's ensemble was "
+            "scored at, or --threshold-strategy vertical_average to select one from a "
+            "cross-validation run's own folds."
+        )
+    return float(threshold)
+
+
 def evaluate_checkpoint(
     checkpoint: dict,
     config: dict,
     test_loader,
     device: torch.device,
     threshold_override: float = None,
+    checkpoint_path=None,
 ):
-    """Run one model over the test set and score it at its stored threshold."""
+    """Run one model over the test set and score it at a given or stored threshold."""
     model = build_model(config, initialize_pretrained=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
@@ -174,7 +198,7 @@ def evaluate_checkpoint(
     threshold = (
         threshold_override
         if threshold_override is not None
-        else checkpoint.get("threshold", DEFAULT_THRESHOLD)
+        else stored_threshold(checkpoint, checkpoint_path)
     )
 
     results = collect_predictions(model, test_loader, loss, device)
@@ -214,7 +238,13 @@ def save_outputs(
         predictions.to_csv(output_dir / "test_predictions.csv", index=False)
 
 
-def log_to_wandb(metadata, config, metrics: dict):
+def log_to_wandb(metadata, config, metrics: dict, output_dir: Path):
+    """Attach one checkpoint's test metrics to the run that produced it.
+
+    output_dir is passed in rather than rebuilt from the config: the same checkpoint is
+    evaluated at several operating points, each writing into its own subdirectory, so
+    reconstructing the path here would find the wrong plot or none at all.
+    """
     run = wandb.init(
         id=metadata["run_id"],
         resume="must",
@@ -227,12 +257,7 @@ def log_to_wandb(metadata, config, metrics: dict):
             continue
         run.summary[f"Test {key}"] = value
 
-    plot_path = (
-        Path(config.get("evaluation", {}).get("output_dir", "evaluations"))
-        / metadata["run_id"]
-        / "confusion_matrix.png"
-    )
-    run.log({"Test Confusion Matrix": wandb.Image(str(plot_path))})
+    run.log({"Test Confusion Matrix": wandb.Image(str(output_dir / "confusion_matrix.png"))})
     run.finish()
 
 
@@ -249,57 +274,82 @@ def resolve_evaluation_config(config: dict, args) -> dict:
 
 def resolve_threshold_config(config: dict, args) -> dict:
     """Threshold-selection settings: CLI over config over module defaults."""
-    block = config.get("threshold", {})
+    # Evaluation starts from stored metadata. Metadata with no strategy at all keeps
+    # the historical fallback rather than silently changing old results.
+    block = normalize_threshold_config(
+        config, legacy_missing_strategy=True
+    )["threshold"]
     return {
-        "cv_strategy": (
-            args.threshold_strategy
-            or block.get("cv_strategy", DEFAULT_CV_THRESHOLD_STRATEGY)
-        ),
+        "strategy": args.threshold_strategy or block["strategy"],
         "fpr_rounding": (
             args.fpr_rounding or block.get("fpr_rounding", DEFAULT_FPR_ROUNDING)
         ),
         "fpr_grid": block.get("fpr_grid", 101),
         "threshold_grid": block.get("threshold_grid", 0),
+        "objective": block.get("objective", DEFAULT_THRESHOLD_OBJECTIVE),
+        "num_thresholds": block.get("num_thresholds", DEFAULT_NUM_THRESHOLDS),
+        "tie_break": block.get("tie_break", DEFAULT_THRESHOLD_TIE_BREAK),
+        "value": block.get("value"),
     }
 
 
-def load_fold_validation_predictions(fold_paths: dict) -> tuple[dict, dict]:
+def require_complete_predictions(fold_paths: dict, fold_predictions: dict) -> None:
+    """Refuse to average over folds when any fold's predictions are absent.
+
+    Every offender is listed rather than only the first -- a resumed run can mix folds
+    from before and after predictions were stored, so failing on one would hide the rest.
+    """
+    missing = [str(path) for fold, path in sorted(fold_paths.items()) if fold not in fold_predictions]
+    if not missing:
+        return
+    listed = "\n  ".join(missing)
+    raise ValueError(
+        "These checkpoints store no validation predictions, so a shared operating "
+        f"point cannot be chosen from them:\n  {listed}\n"
+        "They were written before predictions were stored. Either retrain, or "
+        "evaluate with --threshold-strategy per_fold_youden to use each fold's own "
+        "stored threshold, or pin one with --threshold."
+    )
+
+
+def load_fold_validation_predictions(
+    fold_paths: dict, strict: bool = True
+) -> tuple[dict, dict]:
     """Every fold's stored validation predictions and its own tuned threshold.
 
     Deliberately two-pass: this reads each checkpoint, keeps only the small prediction
     tensors, and drops the reference before the caller reloads the weights it needs. One
     extra read per fold buys not holding five DenseNet121 state dicts in memory at once.
 
-    Raises when any checkpoint predates prediction storage, listing every offender --
-    a resumed run can mix folds from before and after, so failing on the first would hide
-    the rest. Never degrades silently to a per-fold threshold: the averaging strategies
-    are not defined without these.
+    Under strict it raises when any checkpoint predates prediction storage, which is what
+    the averaging strategies need since they are not defined without every fold. Lenient
+    mode returns whatever is present, for the reporting path where a missing fold falls
+    back to its recorded metrics rather than invalidating the run.
     """
-    predictions, stored_thresholds, missing = {}, {}, []
+    predictions, stored_thresholds = {}, {}
     for fold_number, path in sorted(fold_paths.items()):
         checkpoint = torch.load(path, map_location="cpu")
         packed = checkpoint.get("val_predictions")
-        if packed is None:
-            missing.append(str(path))
-        else:
+        if packed is not None:
             predictions[fold_number] = unpack_predictions(packed)
-        stored_thresholds[fold_number] = checkpoint.get("threshold", DEFAULT_THRESHOLD)
+        # None for a fold trained after threshold selection left training. Reported
+        # rather than defaulted, so per_fold_youden can fail on exactly those folds.
+        stored_thresholds[fold_number] = checkpoint.get("threshold")
         del checkpoint
 
-    if missing:
-        listed = "\n  ".join(missing)
-        raise ValueError(
-            "These checkpoints store no validation predictions, so a shared operating "
-            f"point cannot be chosen from them:\n  {listed}\n"
-            "They were written before predictions were stored. Either retrain, or "
-            "evaluate with --threshold-strategy per_fold_youden to use each fold's own "
-            "stored threshold, or pin one with --threshold."
-        )
+    if strict:
+        require_complete_predictions(fold_paths, predictions)
     return predictions, stored_thresholds
 
 
-def select_fold_thresholds(fold_paths: dict, config: dict, args) -> dict:
-    """One operating point per fold, plus a record of how it was chosen."""
+def select_fold_thresholds(
+    fold_paths: dict, config: dict, args, fold_predictions: dict = None
+) -> dict:
+    """One operating point per fold, plus a record of how it was chosen.
+
+    fold_predictions may be passed in when the caller has already read the checkpoints,
+    which saves re-reading five state dicts to get at five small arrays.
+    """
     if args.threshold is not None:
         return {
             "strategy": "cli_override",
@@ -308,8 +358,17 @@ def select_fold_thresholds(fold_paths: dict, config: dict, args) -> dict:
             "skipped_folds": [],
         }
 
+    if getattr(args, "threshold_from", None) is not None:
+        threshold, record = inherited_operating_point(args.threshold_from, args)
+        return {
+            **record,
+            "shared_threshold": threshold,
+            "fold_thresholds": {fold: threshold for fold in fold_paths},
+            "skipped_folds": [],
+        }
+
     threshold_config = resolve_threshold_config(config, args)
-    strategy = threshold_config["cv_strategy"]
+    strategy = threshold_config["strategy"]
 
     if strategy == "per_fold_youden":
         # Reads the thresholds already in the checkpoints, so runs trained before
@@ -317,24 +376,246 @@ def select_fold_thresholds(fold_paths: dict, config: dict, args) -> dict:
         stored = load_stored_thresholds(fold_paths)
         return select_cv_thresholds(strategy=strategy, fold_stored_thresholds=stored)
 
-    predictions, _ = load_fold_validation_predictions(fold_paths)
+    if strategy == "fixed":
+        return select_cv_thresholds(
+            strategy=strategy,
+            fold_stored_thresholds={fold: None for fold in fold_paths},
+            fixed_value=threshold_config["value"],
+        )
+
+    if fold_predictions is None:
+        fold_predictions, _ = load_fold_validation_predictions(fold_paths)
+    else:
+        require_complete_predictions(fold_paths, fold_predictions)
     return select_cv_thresholds(
         strategy=strategy,
-        fold_predictions=predictions,
+        fold_predictions=fold_predictions,
         fpr_rounding=threshold_config["fpr_rounding"],
         fpr_grid=threshold_config["fpr_grid"],
         threshold_grid=threshold_config["threshold_grid"],
+        objective=threshold_config["objective"],
+        num_thresholds=threshold_config["num_thresholds"],
+        tie_break=threshold_config["tie_break"],
+        fixed_value=threshold_config["value"],
     )
 
 
 def load_stored_thresholds(fold_paths: dict) -> dict:
-    """Just the tuned threshold each fold wrote, with no requirement on predictions."""
-    stored = {}
+    """Just the tuned threshold each fold wrote, with no requirement on predictions.
+
+    Every offender is listed rather than only the first: a resumed run can mix folds
+    trained before and after threshold selection left training, so failing on fold 1
+    would hide that folds 3 and 5 are in the same state.
+    """
+    stored, missing = {}, []
     for fold_number, path in sorted(fold_paths.items()):
         checkpoint = torch.load(path, map_location="cpu")
-        stored[fold_number] = checkpoint.get("threshold", DEFAULT_THRESHOLD)
+        if checkpoint.get("threshold") is None:
+            missing.append(str(path))
+        else:
+            stored[fold_number] = float(checkpoint["threshold"])
         del checkpoint
+
+    if missing:
+        listed = "\n  ".join(missing)
+        raise ValueError(
+            "per_fold_youden needs a threshold stored by each fold, and these store "
+            f"none:\n  {listed}\n"
+            "They were trained after threshold selection left the training loop. Use "
+            "--threshold-strategy vertical_average to choose one cut from the folds' "
+            "stored predictions, or pin one with --threshold."
+        )
     return stored
+
+
+def threshold_definition(config: dict) -> dict:
+    """Semantic threshold settings, independent of legacy key spelling."""
+    block = normalize_threshold_config(
+        config, legacy_missing_strategy=True
+    )["threshold"]
+    strategy = block["strategy"]
+    definition = {"strategy": strategy}
+    if strategy == "cv_common_threshold":
+        for key in ("objective", "num_thresholds", "tie_break"):
+            definition[key] = block[key]
+    elif strategy == "fixed":
+        definition["value"] = block["value"]
+    elif strategy == "vertical_average":
+        definition["fpr_rounding"] = block.get(
+            "fpr_rounding", DEFAULT_FPR_ROUNDING
+        )
+        definition["fpr_grid"] = block.get("fpr_grid", 101)
+    elif strategy == "threshold_average":
+        definition["threshold_grid"] = block.get("threshold_grid", 0)
+    return definition
+
+
+def validate_donor_refit_compatibility(
+    donor_metadata: dict, refit_metadata: dict
+) -> None:
+    """Reject a donor that is not the same training recipe and data partition."""
+    donor_config = donor_metadata["config"]
+    refit_config = refit_metadata["config"]
+    mismatches = []
+    for key in ("dataset", "model", "transforms", "loss", "optimizer", "split"):
+        if donor_config.get(key) != refit_config.get(key):
+            mismatches.append(key)
+    if threshold_definition(donor_config) != threshold_definition(refit_config):
+        mismatches.append("threshold")
+    if mismatches:
+        raise ValueError(
+            "Threshold donor and refit are incompatible in: "
+            + ", ".join(mismatches)
+        )
+
+    donor_cv = donor_metadata.get("cv")
+    refit_split = refit_metadata.get("split")
+    if not donor_cv or not refit_split:
+        raise ValueError(
+            "--threshold-from needs CV donor metadata and refit split metadata"
+        )
+    if list(donor_cv["test_idx"]) != list(refit_split["test_idx"]):
+        raise ValueError("Threshold donor and refit test indices are not identical")
+    donor_development = sorted(
+        {index for fold in donor_cv["folds"] for index in fold["val_idx"]}
+    )
+    if donor_development != sorted(refit_split["train_idx"]):
+        raise ValueError(
+            "Threshold donor CV development pool and refit training pool differ"
+        )
+
+
+def _stored_cv_selection(source_run_dir: Path, donor_metadata: dict):
+    selection = donor_metadata.get("cv", {}).get("threshold_selection")
+    if selection is not None:
+        return selection
+    path = source_run_dir / "threshold_selection.json"
+    if path.exists():
+        with path.open() as handle:
+            return json.load(handle)
+    return None
+
+
+def inherited_operating_point(
+    source_run_dir: Path, args, refit_metadata: dict = None
+) -> tuple[float, dict]:
+    """The exact cut another cross-validation run's ensemble was scored at.
+
+    This is how a single refit model gets an operating point without holding anything
+    back: it borrows the one the folds of the same architecture already agreed on. The
+    threshold block comes from the donor run's own config rather than the model being
+    evaluated, so the number reproduces that run's summary.json exactly and can be
+    checked against it. CLI overrides still win, keeping the documented precedence.
+    """
+
+    donor_metadata = load_metadata(source_run_dir / "metadata.pth")
+    fold_paths = discover_fold_checkpoints(source_run_dir)
+    if "cv" not in donor_metadata:
+        if not fold_paths:
+            raise FileNotFoundError(
+                f"No split_*/{CV_BEST_FILENAME} under {source_run_dir}. "
+                "--threshold-from needs a cross-validation run directory."
+            )
+        raise ValueError("--threshold-from donor metadata is not a CV run")
+    if refit_metadata is not None:
+        validate_donor_refit_compatibility(donor_metadata, refit_metadata)
+
+    stored_selection = _stored_cv_selection(source_run_dir, donor_metadata)
+    if stored_selection is not None and stored_selection.get("threshold") is not None:
+        threshold = float(stored_selection["threshold"])
+        return threshold, {
+            "strategy": "inherited_from_cv",
+            "source_run_dir": str(source_run_dir),
+            "source_run_id": donor_metadata["run_id"],
+            "folds_used": sorted(fold_paths),
+            "cv_selection": stored_selection,
+            "threshold": threshold,
+            "threshold_source": "stored CV selected threshold",
+        }
+
+    if not fold_paths:
+        raise FileNotFoundError(
+            f"No split_*/{CV_BEST_FILENAME} under {source_run_dir}. "
+            "--threshold-from needs a cross-validation run directory."
+        )
+
+    donor_config = donor_metadata["config"]
+    # An old donor without a stored selection is recomputed from its own definition,
+    # never from evaluation-time overrides intended for the target model.
+    donor_args = copy.copy(args)
+    donor_args.threshold_from = None
+    donor_args.threshold_strategy = None
+    donor_args.fpr_rounding = None
+    selection = select_fold_thresholds(fold_paths, donor_config, donor_args)
+    threshold, source_phrase = ensemble_operating_point(
+        selection, selection["fold_thresholds"]
+    )
+    return threshold, {
+        "strategy": "inherited_from_cv",
+        "source_run_dir": str(source_run_dir),
+        "source_run_id": donor_metadata["run_id"],
+        "folds_used": sorted(fold_paths),
+        "cv_selection": selection,
+        "threshold": threshold,
+        "threshold_source": source_phrase,
+    }
+
+
+def resolve_single_threshold(
+    checkpoint: dict,
+    checkpoint_path: Path,
+    args,
+    metadata: dict = None,
+    config: dict = None,
+):
+    """The operating point for one checkpoint, and a record of where it came from.
+
+    Three ways, in precedence order: pinned on the command line, inherited from a
+    cross-validation run's ensemble, or read back from the checkpoint itself for a run
+    trained while training still tuned one.
+    """
+    if args.threshold is not None:
+        return args.threshold, {
+            "strategy": "cli_override",
+            "threshold": args.threshold,
+            "threshold_source": "pinned with --threshold",
+        }
+    if args.threshold_from is not None:
+        return inherited_operating_point(
+            args.threshold_from, args, refit_metadata=metadata
+        )
+    if config is not None:
+        block = normalize_threshold_config(
+            config, legacy_missing_strategy=True
+        )["threshold"]
+        if block["strategy"] == "fixed":
+            threshold = float(block["value"])
+            return threshold, {
+                "strategy": "fixed",
+                "threshold": threshold,
+                "threshold_source": "threshold.value from the fixed strategy",
+            }
+    threshold = stored_threshold(checkpoint, checkpoint_path)
+    return threshold, {
+        "strategy": "checkpoint_stored",
+        "threshold": threshold,
+        "threshold_source": "the threshold this run tuned during training",
+    }
+
+
+def threshold_output_slug(record: dict) -> str:
+    """A directory name naming where the cut came from.
+
+    The same checkpoint is deliberately evaluated at more than one operating point --
+    the inherited cut and a chosen one are two of the reported benchmarks -- so the
+    outputs cannot share a path or the second run would overwrite the first.
+    """
+    strategy = record["strategy"]
+    if strategy == "inherited_from_cv":
+        return f"threshold_from_{record['source_run_id']}"
+    if strategy == "checkpoint_stored":
+        return "threshold_stored"
+    return f"threshold_{record['threshold']:.3f}"
 
 
 def describe_selection(selection: dict) -> str:
@@ -371,20 +652,48 @@ def ensemble_operating_point(
     )
 
 
-def cv_validation_aggregate(metadata: dict) -> dict:
-    """Mean +/- std of the folds' *validation* metrics, as recorded during training.
+def cv_validation_aggregate(
+    metadata: dict, fold_thresholds: dict = None, fold_predictions: dict = None
+) -> dict:
+    """Mean +/- std of the folds' *validation* metrics, at the selected operating point.
 
-    Read from the run's own metadata rather than from wandb, so evaluation stays usable
-    offline. Each fold's numbers come from its best epoch at the threshold that epoch
-    tuned on the same validation split it scores, so they are optimistic -- they are here
-    as the reference the test columns are read against, not as a result.
+    Recomputed from each fold's stored best-epoch predictions rather than read back from
+    the metrics training recorded, so the validation column sits at the same cut as the
+    test columns beside it. Read from the run's own files, never wandb, so evaluation
+    stays usable offline.
+
+    Still optimistic, and still here as the reference the test columns are read against
+    rather than as a result: the cut was chosen on these same predictions.
+
+    Folds trained before predictions were stored fall back to their recorded metrics,
+    which sit at whatever threshold that epoch tuned for itself. A run mixing the two is
+    therefore mixing operating points -- the fallback keeps old runs evaluable, it does
+    not make them consistent.
     """
     fold_results = metadata.get("cv", {}).get("fold_results", {})
-    ordered = [
-        fold_results[key].get("metrics", {})
-        for key in sorted(fold_results)
-        if fold_results.get(key)
-    ]
+    fold_predictions = fold_predictions or {}
+    fold_thresholds = fold_thresholds or {}
+
+    ordered = []
+    for key in sorted(fold_results):
+        result = fold_results.get(key)
+        if not result:
+            continue
+        predictions = fold_predictions.get(key)
+        threshold = fold_thresholds.get(key)
+        if predictions is None or threshold is None:
+            ordered.append(result.get("metrics", {}))
+            continue
+        y_true, y_prob = predictions
+        # loss needs logits, which the stored probabilities cannot reconstruct, so it is
+        # carried over from training rather than recomputed. It is threshold-free, so
+        # the value is the same one either route would give.
+        metrics = compute_metrics(y_true=y_true, y_prob=y_prob, threshold=threshold)
+        recorded_loss = result.get("metrics", {}).get("loss")
+        if recorded_loss is not None:
+            metrics["loss"] = recorded_loss
+        ordered.append(metrics)
+
     return aggregate_fold_metrics([m for m in ordered if m])
 
 
@@ -434,6 +743,13 @@ def print_comparison(summary: dict, n_folds: int, test_n: int):
 
 def evaluate_cv_run(run_dir: Path, args):
     """Every fold's best model on the shared test set, plus mean/std and an ensemble."""
+    if not getattr(args, "allow_cv_test_evaluation", False):
+        raise ValueError(
+            "Refusing to evaluate a CV directory on the test set without "
+            "--allow-cv-test-evaluation. For final reporting, train a fresh refit and "
+            "evaluate its last.pth with --threshold-from checkpoints/<cv-run>."
+        )
+
     metadata = load_metadata(run_dir / "metadata.pth")
     config, config_report = resolve_eval_config(metadata, args.config)
     device = resolve_device(args.device or config.get("device", "auto"))
@@ -446,7 +762,12 @@ def evaluate_cv_run(run_dir: Path, args):
         )
 
     evaluation = resolve_evaluation_config(config, args)
-    selection = select_fold_thresholds(fold_paths, config, args)
+    # Read once, leniently, and share: the threshold selection needs every fold's
+    # predictions and the validation column needs whichever ones exist.
+    fold_predictions, _ = load_fold_validation_predictions(fold_paths, strict=False)
+    selection = select_fold_thresholds(
+        fold_paths, config, args, fold_predictions=fold_predictions
+    )
     fold_thresholds = selection["fold_thresholds"]
     print(describe_selection(selection))
 
@@ -541,7 +862,9 @@ def evaluate_cv_run(run_dir: Path, args):
     )
 
     aggregate = aggregate_fold_metrics(fold_metrics)
-    validation = cv_validation_aggregate(metadata)
+    validation = cv_validation_aggregate(
+        metadata, fold_thresholds=fold_thresholds, fold_predictions=fold_predictions
+    )
     summary = {
         "run_id": metadata["run_id"],
         "folds_evaluated": sorted(fold_paths),
@@ -646,21 +969,46 @@ def main():
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log-wandb", action="store_true")
-    parser.add_argument(
+    # Two ways to supply an operating point outright. Mutually exclusive at the argparse
+    # level so passing both is a usage error rather than one silently winning.
+    operating_point = parser.add_mutually_exclusive_group()
+    operating_point.add_argument(
         "--threshold",
         type=float,
         default=None,
         help=(
             "Pin the decision threshold for every fold, bypassing threshold selection "
-            "entirely. Defaults to whatever the configured strategy chooses, or "
-            f"{DEFAULT_THRESHOLD} when a checkpoint carries no threshold at all."
+            "entirely. Defaults to whatever the configured strategy chooses, or to the "
+            "threshold the checkpoint recorded for a single non-CV model."
+        ),
+    )
+    operating_point.add_argument(
+        "--threshold-from",
+        type=Path,
+        default=None,
+        metavar="CV_RUN_DIR",
+        help=(
+            "Inherit the operating point another cross-validation run's ensemble was "
+            "scored at, given that run's directory (checkpoints/<run_id>). This is how "
+            "a single model refit on all the training data gets a threshold without "
+            "holding anything back: the folds of the same architecture already chose "
+            "one, and reusing it makes the two directly comparable."
         ),
     )
     parser.add_argument(
         "--threshold-strategy",
         choices=CV_THRESHOLD_STRATEGIES,
         default=None,
-        help="Override threshold.cv_strategy for a cross-validation run.",
+        help="Override threshold.strategy for a cross-validation run.",
+    )
+    parser.add_argument(
+        "--allow-cv-test-evaluation",
+        action="store_true",
+        help=(
+            "Explicitly permit legacy diagnostic evaluation of every CV fold on the "
+            "test set. Final reporting should evaluate a fresh refit with "
+            "--threshold-from instead."
+        ),
     )
     parser.add_argument(
         "--fpr-rounding",
@@ -679,7 +1027,7 @@ def main():
         return
 
     checkpoint, metadata = load_checkpoint_and_metadata(args.checkpoint)
-    config, _ = resolve_eval_config(metadata, args.config)
+    config, config_report = resolve_eval_config(metadata, args.config)
     evaluation = resolve_evaluation_config(config, args)
     requested_device = args.device or config.get("device", "auto")
     device = resolve_device(requested_device)
@@ -689,17 +1037,26 @@ def main():
     source = build_dataset_source(config)
     test_loader = source.test_loader(test_idx)
 
-    # A single checkpoint has one validation split, so there are no curves to average
-    # across; it keeps the threshold it tuned during training unless one is pinned.
-    metrics, results, threshold = evaluate_checkpoint(
-        checkpoint, config, test_loader, device, args.threshold
+    # A single checkpoint has no folds to average across, so its operating point is
+    # supplied rather than derived: pinned, inherited from a CV run, or read back from a
+    # run trained while training still tuned one.
+    threshold, threshold_record = resolve_single_threshold(
+        checkpoint, args.checkpoint, args, metadata=metadata, config=config
     )
+    print(f"threshold: {threshold:.4f} ({threshold_record['threshold_source']})")
+    metrics, results, _ = evaluate_checkpoint(
+        checkpoint, config, test_loader, device, threshold, args.checkpoint
+    )
+    metrics["threshold_source"] = threshold_record["threshold_source"]
 
     fold = detect_fold(checkpoint, args.checkpoint)
     output_dir = evaluation["output_dir"] / metadata["run_id"]
     if fold is not None:
         metrics["fold"] = fold
         output_dir = output_dir / f"fold_{fold}"
+    # One checkpoint is deliberately scored at more than one operating point, so the
+    # outputs are kept apart by where the cut came from.
+    output_dir = output_dir / threshold_output_slug(threshold_record)
 
     predictions = build_predictions_frame(source, test_idx, results, threshold)
     save_outputs(
@@ -709,6 +1066,19 @@ def main():
         confusion_matrix_values=metrics["confusion_matrix"],
         output_path=output_dir / "confusion_matrix.png",
     )
+    with (output_dir / "summary.json").open("w") as f:
+        json.dump(
+            {
+                "run_id": metadata["run_id"],
+                "checkpoint": str(args.checkpoint),
+                "test_n": len(test_idx),
+                "threshold_selection": threshold_record,
+                "eval_config": config_report,
+                "metrics": metrics,
+            },
+            f,
+            indent=2,
+        )
 
     print(json.dumps(metrics, indent=2))
     print(f"Saved evaluation outputs to {output_dir}")
@@ -718,6 +1088,7 @@ def main():
             metadata=metadata,
             config=config,
             metrics=metrics,
+            output_dir=output_dir,
         )
 
 

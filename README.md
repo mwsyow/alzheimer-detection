@@ -56,23 +56,24 @@ uv run python train.py --resume checkpoints/<wandb_run_id>/best_epoch_003.pth
 
 ## Test Evaluation
 
-Use `evaluate.py` after selecting a final checkpoint. It evaluates only the held-out test split saved in `metadata.pth`.
+Select the operating threshold from CV, train a fresh refit for its explicitly configured
+epoch count, then evaluate that refit's `last.pth` with the stored CV threshold:
 
 ```bash
-uv run python evaluate.py --checkpoint checkpoints/<wandb_run_id>/best_epoch_000.pth
+uv run python train.py --config configs/<cv-config>.json
+uv run python train.py --config configs/<refit-config>.json
+uv run python evaluate.py \
+  --checkpoint checkpoints/<refit_run_id>/last.pth \
+  --threshold-from checkpoints/<cv_run_id>
 ```
 
-Choose a device explicitly if needed:
+Add `--device cpu` or `--device cuda` to choose a device, and `--log-wandb` to attach
+the final metrics to the refit run. Direct CV-directory test evaluation is diagnostic
+only and requires `--allow-cv-test-evaluation`.
 
 ```bash
-uv run python evaluate.py --checkpoint checkpoints/<wandb_run_id>/best_epoch_000.pth --device cpu
-uv run python evaluate.py --checkpoint checkpoints/<wandb_run_id>/best_epoch_000.pth --device cuda
-```
-
-To log final test metrics to the same W&B run:
-
-```bash
-uv run python evaluate.py --checkpoint checkpoints/<wandb_run_id>/best_epoch_000.pth --log-wandb
+uv run python evaluate.py --checkpoint checkpoints/<cv_run_id> \
+  --allow-cv-test-evaluation
 ```
 
 Evaluation outputs are saved under:
@@ -83,7 +84,7 @@ evaluations/<wandb_run_id>/
 
 Files:
 
-- `test_metrics.json`: test loss, accuracy, balanced accuracy, precision, sensitivity, specificity, F1, ROC-AUC, and confusion matrix.
+- `test_metrics.json`: test loss, AUROC, AUPRC, accuracy, balanced accuracy, sensitivity, specificity, precision, NPV, F1, FPR, threshold provenance, and confusion matrix.
 - `test_predictions.csv`: image path, true label, predicted label, and class-1 probability.
 
 ## W&B Sweep

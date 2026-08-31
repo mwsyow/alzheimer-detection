@@ -6,13 +6,21 @@ shared operating point. If a refactor breaks that, the complexity stays and the 
 silently goes, so it is asserted directly rather than left to inspection.
 """
 
+import argparse
 import json
 
 import numpy as np
 import pytest
 import torch
 
-from evaluate import resolve_eval_config
+from evaluate import (
+    discover_fold_checkpoints,
+    ensemble_operating_point,
+    inherited_operating_point,
+    load_stored_thresholds,
+    resolve_eval_config,
+    stored_threshold,
+)
 from metrics import (
     DEFAULT_THRESHOLD,
     FPR_ROUNDING_POLICIES,
@@ -392,3 +400,130 @@ def test_eval_config_does_not_mutate_the_metadata(trained_metadata, tmp_path):
     path = write_config(tmp_path, {"device": "cpu"})
     resolve_eval_config(trained_metadata, path)
     assert trained_metadata["config"]["device"] == "cuda"
+
+
+# ------------------------------------------------------- the cut a single model inherits
+
+
+def write_cv_run(tmp_path, folds, thresholds=None, config=None):
+    """A minimal cross-validation run directory: per-fold checkpoints plus metadata."""
+    for fold, (y_true, y_prob) in folds.items():
+        fold_dir = tmp_path / f"split_{fold}"
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"fold": fold, "val_predictions": pack_predictions(y_true, y_prob)}
+        if thresholds is not None:
+            payload["threshold"] = thresholds[fold]
+        torch.save(payload, fold_dir / "best_model.pth")
+
+    torch.save(
+        {
+            "run_id": "donor001",
+            "config": config or {"threshold": {"cv_strategy": "vertical_average"}},
+            "cv": {"test_idx": [0, 1, 2], "folds": []},
+        },
+        tmp_path / "metadata.pth",
+    )
+    return tmp_path
+
+
+def threshold_args(**overrides):
+    defaults = {
+        "threshold": None,
+        "threshold_from": None,
+        "threshold_strategy": None,
+        "fpr_rounding": None,
+    }
+    return argparse.Namespace(**{**defaults, **overrides})
+
+
+def test_the_inherited_cut_is_the_ensembles_own(tmp_path, folds):
+    """Benchmark 2 must score the single model at exactly benchmark 1's operating point.
+
+    Computed here the long way -- select, then take the ensemble's cut -- and compared
+    against what --threshold-from produces, so the two benchmarks cannot drift apart.
+    """
+    run_dir = write_cv_run(tmp_path, folds)
+    # From the round-tripped predictions, not the float64 originals: pack_predictions
+    # stores y_prob as float32, and the real pipeline reads it back from disk on both
+    # sides. Comparing against the in-memory arrays would fail at about 1e-8 and say
+    # nothing about whether the two benchmarks agree.
+    round_tripped = {
+        fold: unpack_predictions(
+            torch.load(run_dir / f"split_{fold}" / "best_model.pth", weights_only=False)[
+                "val_predictions"
+            ]
+        )
+        for fold in folds
+    }
+    selection = vertical_average_operating_point(round_tripped)
+    expected, phrase = ensemble_operating_point(selection, selection["fold_thresholds"])
+
+    inherited, record = inherited_operating_point(run_dir, threshold_args())
+
+    assert inherited == expected
+    assert record["threshold_source"] == phrase
+
+
+def test_the_inherited_cut_records_where_it_came_from(tmp_path, folds):
+    """An operating point borrowed from another run is only defensible if it is traceable."""
+    run_dir = write_cv_run(tmp_path, folds)
+    _, record = inherited_operating_point(run_dir, threshold_args())
+
+    assert record["strategy"] == "inherited_from_cv"
+    assert record["source_run_id"] == "donor001"
+    assert record["folds_used"] == sorted(folds)
+    assert record["cv_selection"]["strategy"] == "vertical_average"
+    assert "target_fpr" in record["cv_selection"]
+
+
+def test_the_inherited_cut_uses_the_donors_own_strategy(tmp_path, folds):
+    """The donor's config decides, so the number reproduces that run's own summary.json."""
+    run_dir = write_cv_run(
+        tmp_path, folds, config={"threshold": {"cv_strategy": "threshold_average"}}
+    )
+    _, record = inherited_operating_point(run_dir, threshold_args())
+    assert record["cv_selection"]["strategy"] == "threshold_average"
+
+
+def test_inheriting_from_a_directory_with_no_folds_raises(tmp_path):
+    torch.save({"run_id": "x", "config": {}}, tmp_path / "metadata.pth")
+    with pytest.raises(FileNotFoundError, match="threshold-from"):
+        inherited_operating_point(tmp_path, threshold_args())
+
+
+# ------------------------------------------------- a missing threshold fails out loud
+
+
+def test_a_checkpoint_without_a_threshold_raises_rather_than_defaulting(tmp_path):
+    """0.5 used to be substituted silently, reporting an untuned cut as validated."""
+    path = tmp_path / "last.pth"
+    with pytest.raises(ValueError) as excinfo:
+        stored_threshold({"epoch": 3}, path)
+
+    message = str(excinfo.value)
+    assert str(path) in message
+    for route in ("--threshold", "--threshold-from", "--threshold-strategy"):
+        assert route in message, f"the error should name {route}"
+
+
+def test_a_stored_threshold_is_still_honoured(tmp_path):
+    assert stored_threshold({"threshold": 0.37}) == pytest.approx(0.37)
+
+
+def test_per_fold_youden_lists_every_fold_missing_a_threshold(tmp_path, folds):
+    """A resumed run can mix folds from before and after, so one name is not enough."""
+    run_dir = write_cv_run(tmp_path, folds, thresholds={1: 0.4, 2: None, 3: None})
+    fold_paths = discover_fold_checkpoints(run_dir)
+
+    with pytest.raises(ValueError) as excinfo:
+        load_stored_thresholds(fold_paths)
+
+    message = str(excinfo.value)
+    assert "split_2" in message and "split_3" in message
+    assert "split_1" not in message
+
+
+def test_per_fold_youden_still_works_for_a_legacy_run(tmp_path, folds):
+    run_dir = write_cv_run(tmp_path, folds, thresholds={1: 0.4, 2: 0.5, 3: 0.6})
+    stored = load_stored_thresholds(discover_fold_checkpoints(run_dir))
+    assert stored == {1: 0.4, 2: 0.5, 3: 0.6}

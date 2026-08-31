@@ -183,6 +183,65 @@ uv run python train.py --config configs/my_config.json --resume checkpoints/<run
 wandb gets one parent run (aggregate + sweep objective) plus one child per fold
 (per-epoch curves), sharing a group.
 
+## `refit`
+
+For the **final model**: one network trained on everything except the test set. Enabled
+by the presence of the block, exactly like `cv`; the two are alternatives and enabling
+both raises.
+
+```json
+"cv":    { "enabled": false, "n_splits": 5, "shuffle": true, "random_seed": 42 },
+"refit": { "enabled": true }
+```
+
+Otherwise identical to a single-split run: the same `split` numbers produce the same test
+set, and `train_size` + `val_size` are then pooled into one training set (199 volumes on
+OASIS, against 164 for a single split). No other setting changes meaning.
+
+**Do not try to get this by setting `val_size: 0`.** `split` carves off `val + test`
+together and then halves it, so a two-way split at the same `test_size` and seed lands on
+a *different* test set — measured at 23 of 36 volumes in common — and every number would
+be incomparable with the runs already on disk. (It also just raises: the inner split
+would need `test_size=1.0`.)
+
+With nothing held back there is nothing to select on, so **`last.pth` at `epochs` is the
+model** and these are ignored, with one line on stdout and a `Refit Ignored Settings`
+summary key saying so:
+
+- `checkpoint.monitor` / `mode` / `min_delta` — no validation metric to monitor
+- `checkpoint.save_best` — forced off; no epoch is "best"
+- `early_stopping` — no validation signal to stall against
+
+They stay in the file so a refit config is its CV sibling plus one block. Two consequences
+worth knowing: no `Best Validation *` summary key is written (deliberately — there is no
+held-out number), and the checkpoint stores `val_loss`, `monitor_value` and
+`val_predictions` as `null` rather than substituting anything. `Refit Final Training AUC`
+and friends are the only read on how the model ended up.
+
+**Choosing `epochs`.** There is no validation curve, so this is a plain config value that
+has to be justified. Take it from the same architecture's CV run — its per-fold best
+epochs are in `metadata["cv"]["fold_results"][k]["epoch"]` and in the `CV Fold Best
+Epochs` summary key — using `round(mean) + 1`, or `median + 1` when one fold is an
+outlier the mean would let dominate. The `+1` turns a 0-indexed epoch into a count.
+Never use the maximum: that is one fold's luckiest epoch, which is exactly the
+overfitting a refit cannot detect. A benchmark protocol's budget is also wrong here — a
+fixed 60 exists to give every arm equal draws at a max-over-epochs objective, and a refit
+takes no max.
+
+Read the number off the CV run of **this** architecture, not a similar one. An epoch
+budget does not transfer between different networks: the two DenseNet arms are the same
+network differing only in whether pretrained weights load, and the pretrained one peaks
+around epoch 4-8 precisely because it starts trained, where a scratch run needs far
+longer. Nothing downstream would catch the swap, since a refit has no validation split.
+
+**Threshold.** A refit has no held-out data to choose an operating point on, so it borrows
+the one its CV sibling's ensemble used:
+
+```bash
+uv run python evaluate.py --checkpoint checkpoints/<refit_run>/last.pth \
+    --threshold-from checkpoints/<cv_run>
+```
+
 ## `dataloader`
 
 `batch_size`, `num_workers`. Note `Simple3DCNN` uses `BatchNorm3d`, whose batch
@@ -215,30 +274,42 @@ swing hard between epochs, and a real best epoch can arrive late.
 
 ## `threshold`
 
-Read by [`evaluate.py`](../evaluate.py) only — how a cross-validation run turns its folds
-into one decision threshold.
+Read after cross-validation and by [`evaluate.py`](../evaluate.py) — how a CV run turns
+its stored out-of-fold predictions into one decision threshold.
 
 ```json
 "threshold": {
-  "cv_strategy": "vertical_average",
-  "fpr_rounding": "at_least",
-  "fpr_grid": 101,
-  "threshold_grid": 0
+  "strategy": "cv_common_threshold",
+  "objective": "balanced_accuracy",
+  "num_thresholds": 1000,
+  "tie_break": "plateau_midpoint"
 }
 ```
 
 | key | values | notes |
 |---|---|---|
-| `cv_strategy` | `vertical_average`, `threshold_average`, `per_fold_youden` | Absent block means `per_fold_youden`, so a run from before this block existed re-evaluates exactly as it did. |
+| `strategy` | `cv_common_threshold`, `fixed`, `vertical_average`, `threshold_average`, `per_fold_youden` | Fresh configs default to `cv_common_threshold`; old stored metadata with no strategy keeps `per_fold_youden`. `cv_strategy` is a legacy alias. |
+| `objective` | `balanced_accuracy`, `f1`, `sensitivity`, `specificity`, `precision` | Metric averaged equally across folds at every common candidate. |
+| `num_thresholds` | int ≥ 2 | Builds `linspace(0, 1, num_thresholds)`. `threshold_grid` is accepted as a legacy alias. |
+| `tie_break` | `plateau_midpoint`, `lowest`, `highest`, `closest_to_0_5` | Deterministic resolution of equal maxima. |
+| `value` | float in `[0, 1]` | Required by `fixed`; no search is performed. |
 | `fpr_rounding` | `at_least`, `nearest`, `at_most` | `vertical_average` only. A fold's achievable false positive rates are multiples of 1/n_negatives, so it lands on the target or steps past it. `at_least` never falls short, which never trades away sensitivity. |
 | `fpr_grid` | int ≥ 2 | `vertical_average` only. 101 gives 0.01 steps, finer than 20 negatives can resolve anyway. |
 | `threshold_grid` | int, or `0` | `threshold_average` only. `0` uses the union of the folds' own ROC thresholds, which is exact; a positive value uses that many evenly spaced points. |
+
+
+**`cv_common_threshold`** evaluates the same numerical candidate on every fold's
+out-of-fold probabilities, averages the configured objective across folds, and chooses
+one cut from that mean curve. It never optimises folds separately and never sees the
+test set. Completed CV runs write `threshold_curve.csv` and `threshold_selection.json`
+beside `metadata.pth`; a fresh refit inherits the stored cut exactly with
+`--threshold-from`.
 
 **`vertical_average`** (Fawcett 2006, Alg. 3) averages the folds' TPR over a shared
 false-positive-rate axis, picks the target FPR maximising `(mean_tpr + 1 - fpr) / 2`, then
 solves each fold back to *its own* probability cut. Because a false positive rate counts
 only ranks within a fold, this is unaffected by one fold's probabilities being on a
-different scale from another's — which they usually are. Prefer it here.
+different scale from another's. It remains available for explicit legacy reporting.
 
 **`threshold_average`** (Fawcett 2006, Alg. 4; what `sklearn`'s
 `TunedThresholdClassifierCV` computes) averages the folds' balanced-accuracy-vs-threshold
@@ -249,10 +320,10 @@ averaging each fold's own `argmax` — `argmax` is non-linear.
 
 **`per_fold_youden`** keeps whatever threshold each fold tuned during its own training.
 
-Both averaging strategies need the validation predictions stored in each fold's
-`best_model.pth`. Checkpoints written before that was added carry only the scalar
-threshold, so they error with a message naming the alternatives rather than silently
-falling back.
+Common and averaging strategies need validation predictions in each fold's
+`best_model.pth`. New checkpoints also store ordered sample indices, and common
+selection verifies that they tile the development pool without touching test data.
+Older checkpoints remain evaluable through explicit legacy strategies.
 
 Override per invocation with `--threshold-strategy` and `--fpr-rounding`, or bypass
 selection entirely with `--threshold`.
@@ -304,7 +375,14 @@ there from a previous version.
 `evaluate.py` takes the same JSON:
 
 ```bash
-uv run python evaluate.py --checkpoint checkpoints/<run_id> --config configs/my_config.json
+uv run python evaluate.py --checkpoint checkpoints/<refit_run>/last.pth \
+  --threshold-from checkpoints/<cv_run> --config configs/my_config.json
+```
+
+Evaluating a CV directory on test is a legacy diagnostic and requires explicit opt-in:
+
+```bash
+uv run python evaluate.py --checkpoint checkpoints/<cv_run> --allow-cv-test-evaluation
 ```
 
 It honours **only** `threshold`, `evaluation`, `device`, the `wandb_*` keys and
@@ -319,10 +397,20 @@ Precedence is **CLI flag > `--config` > the run's metadata > the code's default.
 
 ## Thresholds during training
 
-Independent of the block above: every epoch the threshold is retuned on validation to
-maximise balanced accuracy, and that value is stored in the checkpoint alongside the
-epoch's validation predictions. Those per-epoch numbers are therefore measured at a cut
-fitted to the same 35-odd samples they score, which makes them optimistic — see Leeflang
-et al. (2008) for the magnitude, roughly 6 points at n≈40. Rank the runs on
-`Validation AUC`, which needs no threshold, and treat `Validation Threshold` as a
-diagnostic.
+**There are none.** Training picks no operating point and reports no metric that needs
+one: each epoch logs `Loss`, `AUC` and `Average Precision` for both splits, and nothing
+else. What it does store is the epoch's validation predictions, which is what lets
+`evaluate.py` choose a cut afterwards — see the `threshold` block above.
+
+This used to work the other way: the threshold was retuned on validation every epoch and
+accuracy, balanced accuracy, F1, precision, sensitivity and specificity were reported at
+it, for both splits. Those numbers were measured at a cut fitted to the same 35-odd
+samples they scored, so they were optimistic by construction — see Leeflang et al. (2008)
+for the magnitude, roughly 6 points at n≈40. They are gone rather than caveated. Rank runs
+on `Validation AUC`.
+
+Two consequences for older runs. `checkpoint.monitor` no longer accepts `val_accuracy`,
+`val_balanced_accuracy` or `val_f1` (every config in this directory already used
+`val_auc`), and runs from before this change keep their `Validation Balanced Accuracy`,
+`Validation F1` and `Validation Threshold` keys in wandb while new runs simply do not
+write them — so a table spanning both will have holes in those columns.

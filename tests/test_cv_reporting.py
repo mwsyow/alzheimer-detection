@@ -22,21 +22,7 @@ from evaluate import (
 )
 
 
-class FakeSummary(dict):
-    """A wandb summary is a MutableMapping whose deletions reach the server."""
-
-
-class FakeRun:
-    def __init__(self, summary=None):
-        self.summary = FakeSummary(summary or {})
-        self.logged = {}
-        self.finished = False
-
-    def log(self, values):
-        self.logged.update(values)
-
-    def finish(self):
-        self.finished = True
+from conftest import FakeRun  # noqa: E402
 
 
 @pytest.fixture
@@ -190,6 +176,7 @@ def test_retired_keys_are_deleted_from_a_run_that_already_has_them():
 
 
 def test_validation_column_comes_from_the_runs_own_metadata():
+    """With no stored predictions to recompute from, the recorded metrics are used."""
     metadata = {
         "cv": {
             "fold_results": {
@@ -207,6 +194,73 @@ def test_validation_column_comes_from_the_runs_own_metadata():
 def test_validation_column_tolerates_an_unfinished_or_non_cv_run():
     assert cv_validation_aggregate({})["mean"] == {}
     assert cv_validation_aggregate({"cv": {"fold_results": {1: None}}})["mean"] == {}
+
+
+def _predictions():
+    """Two folds whose thresholded metrics differ sharply from those at 0.5."""
+    y_true = np.array([0, 0, 1, 1])
+    return {
+        1: (y_true, np.array([0.10, 0.30, 0.35, 0.90])),
+        2: (y_true, np.array([0.20, 0.40, 0.45, 0.80])),
+    }
+
+
+def test_validation_column_is_recomputed_at_the_selected_cut():
+    """The point of recomputing: the column must sit at the cut the test column uses.
+
+    Fold 1's third sample scores 0.35. At the selected 0.32 it is a true positive and
+    sensitivity is 1.0; at the 0.5 a stored metric might have been computed against, it
+    is a false negative and sensitivity is 0.5. Reading the number back would report the
+    wrong one beside a test column measured at 0.32.
+    """
+    metadata = {"cv": {"fold_results": {1: {"metrics": {}}, 2: {"metrics": {}}}}}
+    aggregate = cv_validation_aggregate(
+        metadata,
+        fold_thresholds={1: 0.32, 2: 0.42},
+        fold_predictions=_predictions(),
+    )
+
+    assert aggregate["mean"]["sensitivity"] == pytest.approx(1.0)
+    assert aggregate["mean"]["threshold"] == pytest.approx(0.37)
+
+
+def test_validation_column_carries_the_loss_over_rather_than_inventing_one():
+    """Loss needs logits, which stored probabilities cannot reconstruct."""
+    metadata = {
+        "cv": {
+            "fold_results": {
+                1: {"metrics": {"loss": 0.40}},
+                2: {"metrics": {"loss": 0.60}},
+            }
+        }
+    }
+    aggregate = cv_validation_aggregate(
+        metadata,
+        fold_thresholds={1: 0.32, 2: 0.42},
+        fold_predictions=_predictions(),
+    )
+    assert aggregate["mean"]["loss"] == pytest.approx(0.50)
+
+
+def test_validation_column_falls_back_per_fold_for_a_legacy_checkpoint():
+    """A run mixing folds from before and after predictions were stored stays readable."""
+    metadata = {
+        "cv": {
+            "fold_results": {
+                1: {"metrics": {"roc_auc": 0.11}},
+                2: {"metrics": {"roc_auc": 0.99}},
+            }
+        }
+    }
+    predictions = _predictions()
+    aggregate = cv_validation_aggregate(
+        metadata,
+        fold_thresholds={1: 0.32, 2: 0.42},
+        # Fold 1 has predictions and is recomputed; fold 2 has none and is read back.
+        fold_predictions={1: predictions[1]},
+    )
+
+    assert aggregate["mean"]["roc_auc"] == pytest.approx((1.0 + 0.99) / 2)
 
 
 def _config():

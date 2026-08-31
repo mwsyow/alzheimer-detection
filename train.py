@@ -1,9 +1,11 @@
 import argparse
 import copy
+import csv
 import json
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 from dotenv import load_dotenv
 from monai.data import DataLoader
@@ -13,33 +15,45 @@ import wandb
 from datasets import (
     build_cv_split_indices,
     build_dataset_source,
+    build_refit_split_indices,
     build_split_indices,
-    is_cv_enabled,
+    resolve_split_mode,
 )
 from metrics import (
-    TRAINING_LOG_METRICS,
-    VALIDATION_LOG_METRICS,
+    CV_THRESHOLD_STRATEGIES,
+    DEFAULT_CV_THRESHOLD_STRATEGY,
+    DEFAULT_NEW_CV_THRESHOLD_STRATEGY,
+    DEFAULT_NUM_THRESHOLDS,
+    DEFAULT_THRESHOLD_OBJECTIVE,
+    DEFAULT_THRESHOLD_TIE_BREAK,
+    EPOCH_LOG_METRICS,
+    THRESHOLD_OBJECTIVES,
+    THRESHOLD_TIE_BREAKS,
     WANDB_METRIC_LABELS,
     aggregate_fold_metrics,
     collect_predictions,
-    compute_metrics,
     pack_predictions,
-    select_threshold,
+    ranking_metrics,
+    select_cv_thresholds,
     summarize_predictions,
     to_wandb_logs,
+    unpack_prediction_bundle,
 )
 from models import build_model
 
 load_dotenv(override=True)
 
-# checkpoint.monitor value -> key in the metrics dict returned by compute_metrics.
+# checkpoint.monitor value -> key in the metrics dict returned by ranking_metrics.
+#
+# Threshold-free only, because that is all training computes. A monitor naming a
+# thresholded metric used to be accepted and then quietly do nothing: the key was absent,
+# resolve_monitor_value returned None, is_improvement read None as "no improvement", and
+# the run trained to completion without ever checkpointing. Better to reject the name.
 MONITOR_METRIC_KEYS = {
     "val_loss": "loss",
     "val_auc": "roc_auc",
     "val_roc_auc": "roc_auc",
-    "val_balanced_accuracy": "balanced_accuracy",
-    "val_accuracy": "accuracy",
-    "val_f1": "f1",
+    "val_average_precision": "average_precision",
 }
 
 # define_metric(summary="max") stores a nested {"max": ...} dict rather than a scalar,
@@ -49,9 +63,7 @@ MONITOR_SUMMARY_KEYS = {
     "val_loss": "Best Validation Loss",
     "val_auc": "Best Validation AUC",
     "val_roc_auc": "Best Validation AUC",
-    "val_balanced_accuracy": "Best Validation Balanced Accuracy",
-    "val_accuracy": "Best Validation Accuracy",
-    "val_f1": "Best Validation F1",
+    "val_average_precision": "Best Validation Average Precision",
 }
 
 # Cross-validation layout: checkpoints/<run_id>/split_<k>/best_model.pth
@@ -72,9 +84,100 @@ def deep_update(base: dict, updates: dict):
     return merged
 
 
-def load_config(config_path: Path):
+def normalize_threshold_config(
+    config: dict, legacy_missing_strategy: bool = False
+) -> dict:
+    """Return a copy with canonical threshold keys and validated legacy aliases.
+
+    Fresh files default to the common OOF sweep. Metadata with no strategy at all keeps
+    the old per-fold-Youden fallback, so historical runs remain reproducible.
+    """
+    config = deep_update({}, config)
+    block = dict(config.get("threshold", {}))
+    canonical = block.get("strategy")
+    legacy = block.get("cv_strategy")
+    if canonical is not None and legacy is not None and canonical != legacy:
+        raise ValueError(
+            "Conflicting threshold.strategy and threshold.cv_strategy values: "
+            f"{canonical!r} != {legacy!r}"
+        )
+    strategy = canonical or legacy
+    if strategy is None:
+        strategy = (
+            DEFAULT_CV_THRESHOLD_STRATEGY
+            if legacy_missing_strategy
+            else DEFAULT_NEW_CV_THRESHOLD_STRATEGY
+        )
+    if strategy not in CV_THRESHOLD_STRATEGIES:
+        raise ValueError(
+            f"Unsupported threshold strategy: {strategy!r}. "
+            f"Expected one of {sorted(CV_THRESHOLD_STRATEGIES)}."
+        )
+
+    block["strategy"] = strategy
+    if strategy == "cv_common_threshold":
+        legacy_grid = block.get("threshold_grid")
+        canonical_grid = block.get("num_thresholds")
+        if (
+            canonical_grid is not None
+            and legacy_grid not in (None, 0)
+            and canonical_grid != legacy_grid
+        ):
+            raise ValueError(
+                "Conflicting threshold.num_thresholds and threshold.threshold_grid "
+                f"values: {canonical_grid!r} != {legacy_grid!r}"
+            )
+        block["objective"] = block.get("objective", DEFAULT_THRESHOLD_OBJECTIVE)
+        block["num_thresholds"] = (
+            canonical_grid
+            if canonical_grid is not None
+            else legacy_grid
+            if legacy_grid not in (None, 0)
+            else DEFAULT_NUM_THRESHOLDS
+        )
+        block["tie_break"] = block.get(
+            "tie_break", DEFAULT_THRESHOLD_TIE_BREAK
+        )
+        if block["objective"] not in THRESHOLD_OBJECTIVES:
+            raise ValueError(
+                f"Unsupported threshold.objective: {block['objective']!r}"
+            )
+        if block["tie_break"] not in THRESHOLD_TIE_BREAKS:
+            raise ValueError(
+                f"Unsupported threshold.tie_break: {block['tie_break']!r}"
+            )
+        if (
+            not isinstance(block["num_thresholds"], int)
+            or block["num_thresholds"] < 2
+        ):
+            raise ValueError("threshold.num_thresholds must be an integer >= 2")
+    elif strategy == "fixed":
+        value = block.get("value")
+        if (
+            not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0.0 <= value <= 1.0
+        ):
+            raise ValueError(
+                "threshold.strategy='fixed' requires threshold.value in [0, 1]"
+            )
+
+    config["threshold"] = block
+    return config
+
+
+def load_config(
+    config_path: Path,
+    legacy_missing_strategy: bool = False,
+    normalize_threshold: bool = True,
+):
     with config_path.open() as f:
-        return json.load(f)
+        config = json.load(f)
+    if not normalize_threshold:
+        return config
+    return normalize_threshold_config(
+        config, legacy_missing_strategy=legacy_missing_strategy
+    )
 
 
 def set_nested(config: dict, dotted_key: str, value):
@@ -152,12 +255,11 @@ def save_checkpoint(
     epoch: int,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    val_loss: float,
     best_monitor_value: float,
     early_stopping_counter: int,
-    threshold: float,
     monitor_name: str,
-    monitor_value: float,
+    val_loss: float = None,
+    monitor_value: float = None,
     fold: int = None,
     val_predictions: dict = None,
 ):
@@ -166,32 +268,46 @@ def save_checkpoint(
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            # All three are None for a refit run, which has no validation split to
+            # measure them on. Nothing is substituted: a fabricated value here would be
+            # indistinguishable downstream from one that was actually measured.
             "val_loss": val_loss,
             "best_monitor_value": best_monitor_value,
             "early_stopping_counter": early_stopping_counter,
-            # The operating point tuned on validation; evaluate.py applies it at test time.
-            "threshold": threshold,
             "monitor_name": monitor_name,
             "monitor_value": monitor_value,
             # None for single-split runs; the 1-based fold index under CV, so a
             # checkpoint is self-describing even away from its metadata.
             "fold": fold,
-            # This epoch's validation predictions, packed as tensors. The threshold above
-            # is a derived scalar: stored alone it freezes the operating point, whereas
-            # these let evaluate.py choose one across all folds afterwards, or re-choose
-            # it under a different strategy without retraining.
+            # This epoch's validation predictions, packed as tensors. Since training
+            # selects no threshold, these are the only route to an operating point at
+            # all: evaluate.py chooses one across the folds from exactly these arrays.
+            # A checkpoint without them can only be evaluated at a pinned threshold.
             "val_predictions": val_predictions,
         },
         checkpoint_path,
     )
 
 
-def resolve_monitor_value(metrics: dict, monitor_name: str):
+def validate_monitor(monitor_name: str) -> None:
+    """Reject an unsupported checkpoint.monitor before a single epoch runs.
+
+    Checked eagerly because MONITOR_SUMMARY_KEYS is indexed while train() is still
+    setting up, which would otherwise raise a bare KeyError naming neither the config
+    key at fault nor the accepted values.
+    """
     if monitor_name not in MONITOR_METRIC_KEYS:
         raise ValueError(
             f"Unsupported checkpoint.monitor: {monitor_name!r}. "
-            f"Expected one of {sorted(MONITOR_METRIC_KEYS)}."
+            f"Expected one of {sorted(MONITOR_METRIC_KEYS)}. Training computes only "
+            "threshold-free metrics, so accuracy, balanced accuracy and F1 are no "
+            "longer monitorable -- they need an operating point, which evaluate.py "
+            "chooses after training from the stored validation predictions."
         )
+
+
+def resolve_monitor_value(metrics: dict, monitor_name: str):
+    validate_monitor(monitor_name)
     return metrics.get(MONITOR_METRIC_KEYS[monitor_name])
 
 
@@ -223,6 +339,7 @@ def train(
     early_stopping_config: dict = None,
     device: torch.device = None,
     fold: int = None,
+    val_indices=None,
     summary_key: str = None,
     on_epoch_end=None,
     best_result: dict = None,
@@ -235,10 +352,23 @@ def train(
     min_delta = checkpoint_config.get("min_delta", 0.0)
     monitor_name = checkpoint_config.get("monitor", "val_loss")
     mode = checkpoint_config.get("mode", "min")
+    validate_monitor(monitor_name)
     if best_monitor_value is None:
         best_monitor_value = worst_monitor_value(mode)
     if summary_key is None:
         summary_key = MONITOR_SUMMARY_KEYS[monitor_name]
+
+    # A refit run pools train and val, so there is no held-out split to score. Every
+    # decision that reads one -- the monitor, save_best, early stopping -- is skipped
+    # rather than fed a substitute, and the last epoch's weights are the result.
+    has_validation = val_loader is not None
+    if not has_validation and not checkpoint_config.get("save_last", True):
+        raise ValueError(
+            "Training without a validation split selects no best epoch, so "
+            "checkpoint.save_last must be true or the run would write no checkpoint "
+            "at all."
+        )
+    final_train_metrics = None
     # Carried across a resume so an interrupted fold keeps the best epoch it already found.
     best_result = dict(best_result) if best_result else None
 
@@ -265,47 +395,46 @@ def train(
             labels=torch.cat(train_labels),
             loss_fn=loss,
         )
-        val_results = collect_predictions(
-            model=model,
-            loader=val_loader,
-            loss_fn=loss,
-            device=device,
+        train_metrics = ranking_metrics(
+            train_results["y_true"], train_results["y_prob"], loss=train_results["loss"]
         )
+        final_train_metrics = train_metrics
 
-        threshold, _ = select_threshold(val_results["y_true"], val_results["y_prob"])
-        val_metrics = compute_metrics(
-            y_true=val_results["y_true"],
-            y_prob=val_results["y_prob"],
-            threshold=threshold,
-            loss=val_results["loss"],
-        )
-        # Same threshold for both splits, otherwise the train/val gap compares two
-        # different operating points.
-        train_metrics = compute_metrics(
-            y_true=train_results["y_true"],
-            y_prob=train_results["y_prob"],
-            threshold=threshold,
-            loss=train_results["loss"],
-        )
+        val_metrics = None
+        val_loss = None
+        monitor_value = None
+        improved = False
+        if has_validation:
+            val_results = collect_predictions(
+                model=model,
+                loader=val_loader,
+                loss_fn=loss,
+                device=device,
+            )
+            val_metrics = ranking_metrics(
+                val_results["y_true"], val_results["y_prob"], loss=val_results["loss"]
+            )
+            val_loss = val_metrics["loss"]
+            monitor_value = resolve_monitor_value(val_metrics, monitor_name)
+            improved = is_improvement(
+                monitor_value, best_monitor_value, mode, min_delta
+            )
 
-        val_loss = val_metrics["loss"]
-        monitor_value = resolve_monitor_value(val_metrics, monitor_name)
-        improved = is_improvement(monitor_value, best_monitor_value, mode, min_delta)
-
-        if improved:
-            best_monitor_value = monitor_value
-            early_stopping_counter = 0
-            best_result = {
-                "epoch": ep,
-                "threshold": threshold,
-                "monitor_name": monitor_name,
-                "monitor_value": monitor_value,
-                "metrics": val_metrics,
-            }
-            if fold is not None:
-                best_result["fold"] = fold
-        else:
-            early_stopping_counter += 1
+            if improved:
+                best_monitor_value = monitor_value
+                early_stopping_counter = 0
+                best_result = {
+                    "epoch": ep,
+                    "monitor_name": monitor_name,
+                    "monitor_value": monitor_value,
+                    "metrics": val_metrics,
+                }
+                if fold is not None:
+                    best_result["fold"] = fold
+            else:
+                # Only counted while there is a validation signal to stall against.
+                # Incrementing without one would early-stop a refit run at `patience`.
+                early_stopping_counter += 1
 
         checkpoint_kwargs = {
             "epoch": ep,
@@ -314,12 +443,17 @@ def train(
             "val_loss": val_loss,
             "best_monitor_value": best_monitor_value,
             "early_stopping_counter": early_stopping_counter,
-            "threshold": threshold,
             "monitor_name": monitor_name,
             "monitor_value": monitor_value,
             "fold": fold,
-            "val_predictions": pack_predictions(
-                val_results["y_true"], val_results["y_prob"]
+            "val_predictions": (
+                pack_predictions(
+                    val_results["y_true"],
+                    val_results["y_prob"],
+                    indices=val_indices,
+                )
+                if has_validation
+                else None
             ),
         }
 
@@ -343,12 +477,15 @@ def train(
                 **checkpoint_kwargs,
             )
 
-        early_stopped = early_stopping_config.get(
-            "enabled", False
-        ) and early_stopping_counter >= early_stopping_config.get("patience", 5)
+        early_stopped = (
+            has_validation
+            and early_stopping_config.get("enabled", False)
+            and early_stopping_counter >= early_stopping_config.get("patience", 5)
+        )
         logs = {"Epoch": ep}
-        logs.update(to_wandb_logs(train_metrics, "Training", TRAINING_LOG_METRICS))
-        logs.update(to_wandb_logs(val_metrics, "Validation", VALIDATION_LOG_METRICS))
+        logs.update(to_wandb_logs(train_metrics, "Training"))
+        if has_validation:
+            logs.update(to_wandb_logs(val_metrics, "Validation"))
         logger.log(logs)
 
         # Persist resume state only after the epoch's checkpoints are on disk, so
@@ -365,6 +502,9 @@ def train(
         if early_stopped:
             break
 
+    # Without a validation split best_monitor_value never leaves its infinite sentinel,
+    # so no "Best Validation ..." key is written. That is deliberate: a refit run has no
+    # held-out number, and an absent key is honest where any written value would not be.
     if math.isfinite(best_monitor_value):
         logger.summary[summary_key] = best_monitor_value
 
@@ -373,6 +513,9 @@ def train(
         "best_monitor_value": best_monitor_value if math.isfinite(best_monitor_value) else None,
         "best_result": best_result,
         "early_stopping_counter": early_stopping_counter,
+        # The last epoch's training metrics. For a refit run this is the only read on
+        # how the model ended up, since there is no validation curve.
+        "final_train_metrics": final_train_metrics,
     }
 
 
@@ -492,7 +635,7 @@ def log_fold_summary(parent: wandb.Run, fold_number: int, result: dict):
             "Fold": fold_number,
             **{
                 f"Fold {WANDB_METRIC_LABELS[key]}": metrics[key]
-                for key in VALIDATION_LOG_METRICS
+                for key in EPOCH_LOG_METRICS
                 if metrics.get(key) is not None
             },
             "Fold Best Epoch": best.get("epoch"),
@@ -540,6 +683,166 @@ def save_cv_metadata(checkpoint_dir: Path, run: wandb.Run, config, cv_state: dic
         },
         checkpoint_dir / "metadata.pth",
     )
+
+
+def load_verified_oof_predictions(
+    checkpoint_dir: Path,
+    cv_state: dict,
+    dataset_items: list[dict],
+    require_indices: bool = True,
+) -> dict:
+    """Load selected fold predictions and prove that they are out-of-fold."""
+    test = set(cv_state["test_idx"])
+    expected_development = set(range(len(dataset_items))) - test
+    tiled_validation = set()
+    predictions = {}
+
+    for fold_number, fold in enumerate(cv_state["folds"], start=1):
+        path = fold_dir(checkpoint_dir, fold_number) / CV_BEST_FILENAME
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Selected checkpoint missing for fold {fold_number}: {path}"
+            )
+        checkpoint = torch.load(path, map_location="cpu")
+        packed = checkpoint.get("val_predictions")
+        if packed is None:
+            raise ValueError(f"{path} stores no validation predictions")
+        y_true, y_prob, saved_indices = unpack_prediction_bundle(packed)
+
+        train_indices = list(fold["train_idx"])
+        val_indices = list(fold["val_idx"])
+        train_set, val_set = set(train_indices), set(val_indices)
+        if train_set & val_set:
+            raise ValueError(
+                f"fold {fold_number} has overlapping train and validation indices"
+            )
+        if (train_set | val_set) & test:
+            raise ValueError(
+                f"fold {fold_number} train/validation indices overlap the test set"
+            )
+        if tiled_validation & val_set:
+            raise ValueError("fold validation sets are not disjoint")
+        tiled_validation.update(val_set)
+
+        if saved_indices is None:
+            if require_indices:
+                raise ValueError(
+                    f"{path} has no validation prediction indices; refusing a new "
+                    "common-threshold search because OOF provenance cannot be verified"
+                )
+        else:
+            saved = [int(index) for index in np.asarray(saved_indices).tolist()]
+            if saved != val_indices:
+                raise ValueError(
+                    f"fold {fold_number} saved prediction indices do not exactly "
+                    "match its ordered validation indices"
+                )
+            expected_labels = np.asarray(
+                [dataset_items[index]["label"] for index in saved], dtype=int
+            )
+            if not np.array_equal(np.asarray(y_true, dtype=int), expected_labels):
+                raise ValueError(
+                    f"fold {fold_number} prediction labels do not match dataset labels"
+                )
+
+        if len(y_true) != len(val_indices) or len(y_prob) != len(val_indices):
+            raise ValueError(
+                f"fold {fold_number} prediction count does not match validation count"
+            )
+        predictions[fold_number] = (y_true, y_prob)
+
+    if tiled_validation != expected_development:
+        missing = sorted(expected_development - tiled_validation)
+        extra = sorted(tiled_validation - expected_development)
+        raise ValueError(
+            "fold validation sets do not tile the development pool "
+            f"(missing={missing}, extra={extra})"
+        )
+    return predictions
+
+
+def _json_threshold_selection(selection: dict) -> dict:
+    """Drop the full curve and add the stable scalar name used by donors."""
+    summary = {key: value for key, value in selection.items() if key != "curve"}
+    if selection.get("shared_threshold") is not None:
+        summary["threshold"] = float(selection["shared_threshold"])
+    return summary
+
+
+def select_and_store_cv_threshold(
+    checkpoint_dir: Path,
+    run: wandb.Run,
+    config: dict,
+    cv_state: dict,
+    dataset_items: list[dict],
+) -> dict | None:
+    """Run post-CV threshold selection once and persist its reproducible artifacts."""
+    block = normalize_threshold_config(config)["threshold"]
+    strategy = block["strategy"]
+    if strategy == "per_fold_youden":
+        # Explicit old-checkpoint compatibility. New checkpoints deliberately contain
+        # no independently tuned fold threshold, so there is nothing to recompute here.
+        return None
+
+    predictions = load_verified_oof_predictions(
+        checkpoint_dir,
+        cv_state,
+        dataset_items,
+        require_indices=(strategy == "cv_common_threshold"),
+    )
+    selection = select_cv_thresholds(
+        strategy=strategy,
+        fold_predictions=predictions,
+        fpr_rounding=block.get("fpr_rounding", "at_least"),
+        fpr_grid=block.get("fpr_grid", 101),
+        threshold_grid=block.get("threshold_grid", 0),
+        objective=block.get("objective", DEFAULT_THRESHOLD_OBJECTIVE),
+        num_thresholds=block.get("num_thresholds", DEFAULT_NUM_THRESHOLDS),
+        tie_break=block.get("tie_break", DEFAULT_THRESHOLD_TIE_BREAK),
+        fixed_value=block.get("value"),
+    )
+    summary = _json_threshold_selection(selection)
+    curve = selection.get("curve", [])
+    selection_path = checkpoint_dir / "threshold_selection.json"
+    curve_path = checkpoint_dir / "threshold_curve.csv"
+
+    with selection_path.open("w") as handle:
+        json.dump(summary, handle, indent=2)
+    if curve:
+        with curve_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(curve[0]))
+            writer.writeheader()
+            writer.writerows(curve)
+
+    artifacts = {
+        "threshold_selection": str(selection_path),
+        "threshold_curve": str(curve_path) if curve else None,
+    }
+    cv_state["threshold_selection"] = {**summary, "artifacts": artifacts}
+
+    if strategy == "cv_common_threshold":
+        run.log(
+            {
+                "CV Threshold Sweep": wandb.Table(
+                    columns=list(curve[0]),
+                    data=[[row[key] for key in curve[0]] for row in curve],
+                )
+            }
+        )
+        run.summary["cv_best_threshold"] = summary["threshold"]
+        run.summary["cv_threshold_objective"] = summary["objective"]
+        run.summary["cv_best_mean_objective"] = summary["mean_objective"]
+        run.summary["cv_best_std_objective"] = summary["std_objective"]
+        run.summary["cv_best_mean_balanced_accuracy"] = summary[
+            "mean_balanced_accuracy"
+        ]
+        run.summary["cv_best_std_balanced_accuracy"] = summary[
+            "std_balanced_accuracy"
+        ]
+    elif summary.get("threshold") is not None:
+        run.summary["cv_best_threshold"] = summary["threshold"]
+        run.summary["cv_threshold_objective"] = strategy
+    return selection
 
 
 def run_cross_validation(
@@ -643,6 +946,7 @@ def run_cross_validation(
             early_stopping_config=config["early_stopping"],
             device=device,
             fold=fold_number,
+            val_indices=fold["val_idx"],
             # Children must not write the sweep objective, or they would compete with
             # the parent in the sweep ranking.
             summary_key=FOLD_SUMMARY_KEY,
@@ -661,6 +965,14 @@ def run_cross_validation(
 
         log_fold_summary(run, fold_number, result)
 
+    if len(cv_state["completed_folds"]) == len(cv_state["folds"]):
+        # Deliberately recomputed on completed resumes: the selected checkpoints are
+        # the source of truth, and both artifacts are deterministic replacements.
+        select_and_store_cv_threshold(
+            checkpoint_dir, run, config, cv_state, source.items
+        )
+        save_cv_metadata(checkpoint_dir, run, config, cv_state)
+
     log_cv_aggregate(run, cv_state, monitor_name)
     return cv_state
 
@@ -671,7 +983,8 @@ def runner(
     resume_checkpoint: dict | None = None,
     metadata: dict | None = None,
 ):
-    if is_cv_enabled(config):
+    split_mode = resolve_split_mode(config)
+    if split_mode == "cv":
         return run_cross_validation(
             run=run, config=config, metadata=metadata, is_resume=metadata is not None
         )
@@ -685,7 +998,10 @@ def runner(
     if is_resume:
         split_indices = metadata["split"]
     else:
-        split_indices = build_split_indices(source.items, config)
+        build_indices = (
+            build_refit_split_indices if split_mode == "refit" else build_split_indices
+        )
+        split_indices = build_indices(source.items, config)
         save_metadata(
             checkpoint_dir=checkpoint_dir,
             run=run,
@@ -694,6 +1010,12 @@ def runner(
         )
 
     train_loader, val_loader = source.train_val_loaders(split_indices)
+    if split_mode != "refit" and val_loader is None:
+        raise ValueError(
+            "The split produced an empty validation set, so there would be nothing to "
+            "monitor, checkpoint on, or select an operating point from. Enable the "
+            "refit block if training on everything but the test set was intended."
+        )
 
     loss = build_loss(config)
     model = build_model(config, initialize_pretrained=not is_resume)
@@ -713,7 +1035,31 @@ def runner(
             resume_checkpoint, monitor_name, mode
         )
 
-    return train(
+    checkpoint_config = config["checkpoint"]
+    early_stopping_config = config["early_stopping"]
+    if split_mode == "refit":
+        # A refit config is its cross-validation sibling plus one block, so it carries
+        # these settings verbatim and they are ignored rather than rejected -- rejecting
+        # would force per-arm edits to the very fields the benchmark protocol requires to
+        # be identical across arms. Announced so the omission is visible, not assumed.
+        checkpoint_config = {**checkpoint_config, "save_best": False}
+        early_stopping_config = {}
+        ignored = ["checkpoint.save_best", "checkpoint.monitor", "checkpoint.mode",
+                   "checkpoint.min_delta"]
+        if config["early_stopping"].get("enabled", False):
+            ignored.append("early_stopping")
+        print(
+            f"refit: training on {len(split_indices['train_idx'])} volumes with no "
+            f"validation split for {config['epochs']} epochs; "
+            f"{checkpoint_config.get('last_filename', 'last.pth')} is the model. "
+            f"Ignoring {', '.join(ignored)} -- nothing is held out to select on."
+        )
+        run.summary["Refit Pool N"] = len(split_indices["train_idx"])
+        run.summary["Refit Test N"] = len(split_indices["test_idx"])
+        run.summary["Refit Epochs"] = config["epochs"]
+        run.summary["Refit Ignored Settings"] = ", ".join(ignored)
+
+    result = train(
         epochs=epochs,
         model=model,
         optim=optim,
@@ -724,10 +1070,20 @@ def runner(
         checkpoint_dir=checkpoint_dir,
         best_monitor_value=best_monitor_value,
         early_stopping_counter=early_stopping_counter,
-        checkpoint_config=config["checkpoint"],
-        early_stopping_config=config["early_stopping"],
+        checkpoint_config=checkpoint_config,
+        early_stopping_config=early_stopping_config,
         device=device,
     )
+
+    if split_mode == "refit":
+        # No held-out number exists, so the final training metrics are the only read on
+        # how the model ended up -- whether it collapsed, or memorised the pool.
+        final = result.get("final_train_metrics") or {}
+        for key in EPOCH_LOG_METRICS:
+            if final.get(key) is not None:
+                run.summary[f"Refit Final Training {WANDB_METRIC_LABELS[key]}"] = final[key]
+
+    return result
 
 
 def main():
@@ -761,7 +1117,9 @@ def main():
         else:
             resume_checkpoint = torch.load(args.resume, map_location="cpu")
             metadata = load_metadata(find_metadata_path(args.resume))
-        config = metadata["config"]
+        config = normalize_threshold_config(
+            metadata["config"], legacy_missing_strategy=True
+        )
         wandb_init_kwargs = {
             "id": metadata["run_id"],
             "resume": "must",
@@ -780,12 +1138,12 @@ def main():
     # Without these the run summary holds the *last* epoch's value, so sweeps rank runs
     # by an arbitrary point on the curve rather than by their best epoch.
     wandb_run.define_metric("Validation AUC", summary="max")
-    wandb_run.define_metric("Validation Balanced Accuracy", summary="max")
-    wandb_run.define_metric("Validation F1", summary="max")
+    wandb_run.define_metric("Validation Average Precision", summary="max")
     wandb_run.define_metric("Validation Loss", summary="min")
 
     if args.resume is None:
         config = apply_sweep_overrides(config, wandb_run.config)
+        config = normalize_threshold_config(config)
         wandb_run.config.update(config, allow_val_change=True)
 
     runner(

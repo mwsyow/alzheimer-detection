@@ -282,18 +282,53 @@ def is_cv_enabled(config: dict) -> bool:
     return bool(cv_config.get("enabled", True))
 
 
-def build_cv_split_indices(dataset_items: list[dict], config: dict):
-    """Hold the test set out once, then stratified K-fold over everything else.
+def is_refit_enabled(config: dict) -> bool:
+    """Refit is switched on by the presence of a "refit" block, exactly like "cv".
 
-    The test set comes from the same stratified_three_way_split used by the
-    single-split path, so it is identical to the one every non-CV run has used and
-    results stay directly comparable. The train and val halves are pooled and refolded.
+    An explicit "enabled": false turns it off without having to delete the block.
     """
-    cv_config = config["cv"]
+    refit_config = config.get("refit")
+    if not refit_config:
+        return False
+    return bool(refit_config.get("enabled", True))
+
+
+SPLIT_MODES = ("single", "cv", "refit")
+
+
+def resolve_split_mode(config: dict) -> str:
+    """Which of the three ways to partition the data this config asks for.
+
+    Lives here rather than in train.py so the whole split policy is in one file, and so
+    it can be tested without wandb, a model, or the images.
+    """
+    cv, refit = is_cv_enabled(config), is_refit_enabled(config)
+    if cv and refit:
+        raise ValueError(
+            'cv.enabled and refit.enabled are both true, but they are alternatives: '
+            "cross-validation refolds the pooled train and val indices, while refit "
+            "trains one model on all of them. Enable exactly one."
+        )
+    if cv:
+        return "cv"
+    if refit:
+        return "refit"
+    return "single"
+
+
+def pool_and_test_indices(dataset_items: list[dict], config: dict) -> dict:
+    """The held-out test set, and everything else pooled into one training set.
+
+    The single seam through which both cross-validation and refit obtain the test set,
+    so it is by construction the same set the single-split path produces and results
+    stay directly comparable across all three.
+
+    Returns {"pool_idx", "pool_labels", "test_idx"}.
+    """
     split_config = config["split"]
 
     if uses_dataset_split(config):
-        # Keep the published test split intact, refold everything else.
+        # Keep the published test split intact, pool everything else.
         train_idx, val_idx, test_idx = dataset_split_indices(dataset_items)
     else:
         train_idx, val_idx, test_idx = stratified_three_way_split(
@@ -305,7 +340,50 @@ def build_cv_split_indices(dataset_items: list[dict], config: dict):
         )
 
     pool_idx = sorted(train_idx + val_idx)
-    pool_labels = [dataset_items[idx]["label"] for idx in pool_idx]
+    return {
+        "pool_idx": pool_idx,
+        "pool_labels": [dataset_items[idx]["label"] for idx in pool_idx],
+        "test_idx": test_idx,
+    }
+
+
+def build_refit_split_indices(dataset_items: list[dict], config: dict):
+    """One training set of everything that is not test, and no validation split.
+
+    For the final model: nothing is held back except the test set, so there is no
+    validation curve to select an epoch or an operating point from. Both come from the
+    cross-validation run of the same architecture instead.
+
+    Deliberately routed through the same three-way split as every other path rather than
+    a two-way one. stratified_three_way_split carves off val+test together and then
+    halves it, so a two-way train_test_split at the same test_size and seed lands on a
+    *different* test set -- measured at 23 of 36 volumes in common on OASIS -- and every
+    number reported against it would be incomparable with the runs already on disk.
+    Setting split.val_size to 0 does not work either: relative_test_size becomes 1.0 and
+    scikit-learn rejects it.
+    """
+    pooled = pool_and_test_indices(dataset_items, config)
+    return {
+        "train_idx": pooled["pool_idx"],
+        "val_idx": [],
+        "test_idx": pooled["test_idx"],
+    }
+
+
+def build_cv_split_indices(dataset_items: list[dict], config: dict):
+    """Hold the test set out once, then stratified K-fold over everything else.
+
+    The test set comes from the same stratified_three_way_split used by the
+    single-split path, so it is identical to the one every non-CV run has used and
+    results stay directly comparable. The train and val halves are pooled and refolded.
+    """
+    cv_config = config["cv"]
+    split_config = config["split"]
+
+    pooled = pool_and_test_indices(dataset_items, config)
+    pool_idx = pooled["pool_idx"]
+    pool_labels = pooled["pool_labels"]
+    test_idx = pooled["test_idx"]
 
     n_splits = cv_config["n_splits"]
     if n_splits < 2:
@@ -567,9 +645,17 @@ class DatasetSource:
         )
 
     def train_val_loaders(self, split_indices: dict[str, list[int]]):
+        """Train and validation loaders; the second is None for a refit split.
+
+        Returning None rather than an empty loader keeps the refit path identical to the
+        single-split path apart from which build_*_split_indices produced the indices,
+        and makes "there is no validation split" something callers must handle rather
+        than something they discover as a zero-length iteration.
+        """
+        val_idx = split_indices["val_idx"]
         return (
             self.loader(split_indices["train_idx"], mode="train", shuffle=True),
-            self.loader(split_indices["val_idx"], mode="val"),
+            self.loader(val_idx, mode="val") if val_idx else None,
         )
 
     def fold_loaders(self, fold: dict):

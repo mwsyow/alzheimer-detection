@@ -13,12 +13,26 @@ exemption is listed explicitly rather than left implicit.
 
 import glob
 import json
+import os
 
 import pytest
 
+from datasets import resolve_split_mode
 from models import build_model
 
-BENCH = sorted(glob.glob("configs/bench_*.json"))
+# The cross-validation arms, and their refit siblings. Partitioned because a refit
+# deliberately differs on epochs and cv.enabled: it has no validation split, so the
+# equal-draws reasoning behind the shared epoch budget does not apply to it. Each family
+# is held to its own protocol, and every refit is checked against its own CV sibling.
+ALL_BENCH = sorted(glob.glob("configs/bench_*.json"))
+REFIT_SUFFIX = "_refit.json"
+BENCH = [p for p in ALL_BENCH if not p.endswith(REFIT_SUFFIX)]
+REFIT = [p for p in ALL_BENCH if p.endswith(REFIT_SUFFIX)]
+
+
+def cv_sibling(refit_path):
+    """The refit config's cross-validation counterpart, which it must otherwise match."""
+    return refit_path[: -len(REFIT_SUFFIX)] + ".json"
 
 # Fields that must be byte-identical across every arm.
 PROTOCOL_FIELDS = [
@@ -55,6 +69,7 @@ EXPECTED_ARMS = {
     "configs/bench_resnet10_medicalnet.json": "ResNet10",
     "configs/bench_efficientnet_b0.json": "EfficientNetBN",
     "configs/bench_densenet121.json": "DenseNet121",
+    "configs/bench_densenet121_scratch.json": "DenseNet121",
 }
 
 
@@ -179,3 +194,83 @@ def test_every_arm_has_a_distinct_run_name():
         f"wandb_name unset in {[p for p, n in names.items() if not n]}"
     )
     assert len(set(names.values())) == len(BENCH), f"duplicate run names: {names}"
+
+
+def test_densenet_arms_share_an_identical_architecture():
+    """The pretraining ablation: scratch vs pretrained must differ ONLY in the load.
+
+    This bounds the exposure to the unresolved provenance of 86_acc_model.pth. If the
+    two arms score the same, the checkpoint contributes nothing and any OASIS overlap
+    in it is moot.
+    """
+    a = load("configs/bench_densenet121_scratch.json")["model"]
+    b = load("configs/bench_densenet121.json")["model"]
+    assert a["params"] == b["params"], "the two DenseNet arms must be the same network"
+    assert a["pretrained"]["enabled"] is False
+    assert b["pretrained"]["enabled"] is True
+    assert b["pretrained"]["pretrained_weights_path"].endswith("86_acc_model.pth")
+
+
+# ----------------------------------------------------------------- the refit siblings
+
+# What a refit config is allowed to change relative to its CV sibling, and nothing more.
+# The user's constraint is that a refit is "the same thing as turning off cv and joining
+# train_size and val_size together", using whatever else the same file already says. That
+# is asserted here rather than trusted.
+REFIT_EXEMPT = {"epochs", "cv.enabled", "refit.enabled", "wandb_name"}
+
+
+@pytest.mark.parametrize("path", REFIT)
+def test_a_refit_config_matches_its_cv_sibling(path):
+    sibling = cv_sibling(path)
+    assert os.path.exists(sibling), f"{path} has no CV sibling at {sibling}"
+
+    def flat(d, prefix=""):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                yield from flat(v, f"{prefix}{k}.")
+            else:
+                yield f"{prefix}{k}", v
+
+    ref = dict(flat(load(sibling)))
+    cur = dict(flat(load(path)))
+    diff = {k for k in set(ref) | set(cur) if ref.get(k) != cur.get(k)}
+    unexpected = diff - REFIT_EXEMPT
+    assert not unexpected, f"{path} differs from {sibling} beyond a refit: {unexpected}"
+
+
+@pytest.mark.parametrize("path", REFIT)
+def test_a_refit_config_is_a_refit(path):
+    c = load(path)
+    assert c["refit"]["enabled"] is True
+    assert c["cv"]["enabled"] is False, "cv and refit are alternatives"
+    assert c["early_stopping"]["enabled"] is False
+    assert c["split"]["random_seed"] == 42, "the test split must never move"
+
+
+@pytest.mark.parametrize("path", REFIT)
+def test_a_refit_epoch_budget_is_not_the_cv_protocols(path):
+    """60 exists to give arms equal draws at a max over epochs. A refit takes no max.
+
+    Every architecture measured so far peaks inside its first 15 epochs, so a 60-epoch
+    refit would ship a model tens of epochs past its peak with nothing held out to
+    notice. The budget has to come from this arm's own cross-validation run -- its
+    `CV Fold Best Epochs` summary key, or metadata["cv"]["fold_results"][k]["epoch"].
+    """
+    epochs = load(path)["epochs"]
+    assert epochs != 60, (
+        f"{path}: epochs is still the CV protocol's 60, which exists for a max over "
+        "epochs that a refit does not take. Set it from this arm's CV fold best epochs."
+    )
+    assert 1 <= epochs <= 40, f"{path}: implausible refit budget {epochs}"
+
+
+def test_every_refit_arm_has_a_distinct_run_name():
+    names = {path: load(path).get("wandb_name") for path in REFIT}
+    assert all(names.values()), f"wandb_name unset in {[p for p, n in names.items() if not n]}"
+    assert len(set(names.values())) == len(REFIT), f"duplicate run names: {names}"
+
+
+@pytest.mark.parametrize("path", REFIT)
+def test_a_refit_config_resolves_to_the_refit_mode(path):
+    assert resolve_split_mode(load(path)) == "refit"

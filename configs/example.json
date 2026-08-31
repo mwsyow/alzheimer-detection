@@ -69,6 +69,9 @@
     "shuffle": true,
     "random_seed": 42
   },
+  "refit": {
+    "enabled": false
+  },
   "dataloader": {
     "batch_size": 2,
     "num_workers": 0
@@ -88,10 +91,10 @@
     "patience": 10
   },
   "threshold": {
-    "cv_strategy": "vertical_average",
-    "fpr_rounding": "at_least",
-    "fpr_grid": 101,
-    "threshold_grid": 0
+    "strategy": "cv_common_threshold",
+    "objective": "balanced_accuracy",
+    "num_thresholds": 1000,
+    "tie_break": "plateau_midpoint"
   },
   "evaluation": {
     "output_dir": "evaluations",

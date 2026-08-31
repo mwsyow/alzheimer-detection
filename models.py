@@ -347,6 +347,25 @@ class Simple3DCNN(nn.Module):
         blocks.append(nn.AdaptiveAvgPool3d(1))
         self.net = nn.Sequential(*blocks)
         self.classifier = nn.Linear(current_channels, num_classes)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Explicit baseline initialization; MONAI architectures are untouched."""
+        for module in self.modules():
+            if isinstance(module, nn.Conv3d):
+                nn.init.kaiming_normal_(
+                    module.weight, mode="fan_out", nonlinearity="relu"
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm3d):
+                if module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        nn.init.xavier_uniform_(self.classifier.weight)
+        if self.classifier.bias is not None:
+            nn.init.zeros_(self.classifier.bias)
 
     def forward(self, x: torch.Tensor):
         x = self.net(x)

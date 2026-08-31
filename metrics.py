@@ -5,17 +5,31 @@ import torch
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
-    balanced_accuracy_score,
     confusion_matrix,
     f1_score,
     precision_score,
-    recall_score,
     roc_auc_score,
     roc_curve,
 )
 from torch import nn
 
 DEFAULT_THRESHOLD = 0.5
+DEFAULT_NUM_THRESHOLDS = 1000
+DEFAULT_THRESHOLD_OBJECTIVE = "balanced_accuracy"
+DEFAULT_THRESHOLD_TIE_BREAK = "plateau_midpoint"
+THRESHOLD_OBJECTIVES = (
+    "balanced_accuracy",
+    "f1",
+    "sensitivity",
+    "specificity",
+    "precision",
+)
+THRESHOLD_TIE_BREAKS = (
+    "plateau_midpoint",
+    "lowest",
+    "highest",
+    "closest_to_0_5",
+)
 
 # How a cross-validation run turns K folds into one operating point.
 #   vertical_average  -- Fawcett (2006) Alg. 3: average TPR over a shared FPR grid,
@@ -24,7 +38,17 @@ DEFAULT_THRESHOLD = 0.5
 #                        TunedThresholdClassifierCV: average balanced accuracy over a
 #                        shared threshold grid, take one argmax, share that one cut.
 #   per_fold_youden   -- each fold keeps the threshold it tuned during training.
-CV_THRESHOLD_STRATEGIES = ("vertical_average", "threshold_average", "per_fold_youden")
+CV_THRESHOLD_STRATEGIES = (
+    "cv_common_threshold",
+    "fixed",
+    "vertical_average",
+    "per_fold_youden",
+    "threshold_average",
+)
+# New configuration files are normalised to this strategy before training metadata is
+# written. DEFAULT_CV_THRESHOLD_STRATEGY deliberately remains the historical fallback
+# for metadata created before a strategy field existed.
+DEFAULT_NEW_CV_THRESHOLD_STRATEGY = "cv_common_threshold"
 # A config written before threshold selection existed has no strategy, and must
 # re-evaluate exactly as it did before.
 DEFAULT_CV_THRESHOLD_STRATEGY = "per_fold_youden"
@@ -37,34 +61,31 @@ FPR_ROUNDING_POLICIES = ("at_least", "nearest", "at_most")
 DEFAULT_FPR_ROUNDING = "at_least"
 
 # Metric key -> suffix used when logging to wandb, e.g. "Validation Balanced Accuracy".
+#
+# A registry of every label, not a selection of what to report: evaluate.py's comparison
+# table iterates it in both directions -- forwards to name a row, backwards to find that
+# row's std -- so dropping a key here silently drops a column there. The threshold-
+# dependent entries are unreachable from training and reachable from evaluation.
 WANDB_METRIC_LABELS = {
     "loss": "Loss",
     "roc_auc": "AUC",
+    "average_precision": "Average Precision",
     "balanced_accuracy": "Balanced Accuracy",
     "accuracy": "Accuracy",
     "f1": "F1",
     "precision": "Precision",
     "sensitivity": "Sensitivity",
     "specificity": "Specificity",
+    "npv": "NPV",
+    "fpr": "FPR",
     "threshold": "Threshold",
 }
 
-# Training metrics are computed at the validation-tuned threshold, so there is no
-# separate "Training Threshold" to report.
-VALIDATION_LOG_METRICS = (
-    "loss",
-    "roc_auc",
-    "balanced_accuracy",
-    "accuracy",
-    "f1",
-    "precision",
-    "sensitivity",
-    "specificity",
-    "threshold",
-)
-TRAINING_LOG_METRICS = tuple(
-    key for key in VALIDATION_LOG_METRICS if key != "threshold"
-)
+# What training logs each epoch, for both splits. Every one of these is threshold-free:
+# training picks no operating point, so it has none to report metrics at. A cut is chosen
+# once, in evaluate.py, from the validation predictions the checkpoints carry -- which is
+# the only place it can be applied to data it was not chosen on.
+EPOCH_LOG_METRICS = ("loss", "roc_auc", "average_precision")
 
 
 def summarize_predictions(
@@ -127,6 +148,12 @@ def select_threshold(y_true, y_prob):
 
     Returns (threshold, balanced_accuracy). Falls back to 0.5 when only one class is
     present and the ROC curve is undefined.
+
+    Nothing calls this any more. It is kept because it is the definition of the numbers
+    the `per_fold_youden` strategy reads back: every threshold stored in a checkpoint
+    from before selection left the training loop came from here, chosen on the same
+    validation split it was then used to score. Do not reintroduce it into training --
+    that is what made those per-epoch operating-point metrics optimistic.
     """
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob)
@@ -146,7 +173,7 @@ def select_threshold(y_true, y_prob):
     return threshold, float(balanced_accuracies[best_index])
 
 
-def pack_predictions(y_true, y_prob) -> dict:
+def pack_predictions(y_true, y_prob, indices=None) -> dict:
     """Tensor-only view of one split's predictions, for storing in a checkpoint.
 
     Checkpoints are loaded without ``weights_only=False``, and that guard rejects numpy
@@ -156,10 +183,13 @@ def pack_predictions(y_true, y_prob) -> dict:
     The clone is not redundant: torch.as_tensor shares the numpy buffer, and torch.save
     serialises a tensor's whole underlying storage rather than its view.
     """
-    return {
+    packed = {
         "y_true": torch.as_tensor(np.asarray(y_true)).long().clone(),
         "y_prob": torch.as_tensor(np.asarray(y_prob)).float().clone(),
     }
+    if indices is not None:
+        packed["indices"] = torch.as_tensor(np.asarray(indices)).long().clone()
+    return packed
 
 
 def unpack_predictions(packed: dict):
@@ -169,6 +199,189 @@ def unpack_predictions(packed: dict):
         return value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
 
     return to_numpy(packed["y_true"]), to_numpy(packed["y_prob"])
+
+
+def unpack_prediction_bundle(packed: dict):
+    """Return labels, probabilities, and optional sample indices.
+
+    ``unpack_predictions`` intentionally keeps its historical two-value return shape;
+    callers that verify out-of-fold provenance use this indexed variant instead.
+    """
+
+    y_true, y_prob = unpack_predictions(packed)
+    indices = packed.get("indices")
+    if indices is not None:
+        indices = (
+            indices.detach().cpu().numpy()
+            if torch.is_tensor(indices)
+            else np.asarray(indices)
+        )
+    return y_true, y_prob, indices
+
+
+def _binary_counts(y_true, y_pred) -> tuple[int, int, int, int]:
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    return int(tn), int(fp), int(fn), int(tp)
+
+
+def _threshold_diagnostics(y_true, y_prob, threshold: float) -> dict:
+    y_true = np.asarray(y_true)
+    y_pred = (np.asarray(y_prob) >= threshold).astype(int)
+    tn, fp, fn, tp = _binary_counts(y_true, y_pred)
+
+    sensitivity = tp / (tp + fn) if tp + fn else 0.0
+    specificity = tn / (tn + fp) if tn + fp else 0.0
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    f1 = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0
+    return {
+        "balanced_accuracy": (sensitivity + specificity) / 2.0,
+        "f1": f1,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "precision": precision,
+    }
+
+
+def threshold_tie_index(
+    values, thresholds, tie_break=DEFAULT_THRESHOLD_TIE_BREAK
+) -> int:
+    """Resolve equal maxima on an ordered threshold grid deterministically."""
+    if tie_break not in THRESHOLD_TIE_BREAKS:
+        raise ValueError(
+            f"Unsupported threshold.tie_break: {tie_break!r}. "
+            f"Expected one of {sorted(THRESHOLD_TIE_BREAKS)}."
+        )
+    values = np.asarray(values, dtype=float)
+    thresholds = np.asarray(thresholds, dtype=float)
+    if values.ndim != 1 or values.size == 0 or values.shape != thresholds.shape:
+        raise ValueError(
+            "threshold values and grid must be non-empty one-dimensional arrays"
+        )
+    best = np.nanmax(values)
+    maximisers = np.flatnonzero(
+        np.isclose(values, best, rtol=0.0, atol=1e-12)
+    )
+
+    if tie_break == "lowest":
+        return int(maximisers[0])
+    if tie_break == "highest":
+        return int(maximisers[-1])
+    if tie_break == "closest_to_0_5":
+        distances = np.abs(thresholds[maximisers] - 0.5)
+        return int(
+            maximisers[np.flatnonzero(np.isclose(distances, distances.min()))[0]]
+        )
+
+    runs = np.split(maximisers, np.flatnonzero(np.diff(maximisers) != 1) + 1)
+    widest_length = max(len(run) for run in runs)
+    widest = next(run for run in runs if len(run) == widest_length)
+    # Lower central candidate for an even-sized plateau. It is still an evaluated
+    # member of T, and makes the tie deterministic without inventing a non-grid cut.
+    return int(widest[(len(widest) - 1) // 2])
+
+
+def common_threshold_operating_point(
+    fold_predictions: dict,
+    objective: str = DEFAULT_THRESHOLD_OBJECTIVE,
+    num_thresholds: int = DEFAULT_NUM_THRESHOLDS,
+    tie_break: str = DEFAULT_THRESHOLD_TIE_BREAK,
+) -> dict:
+    """Select one numerical cut by maximising the mean fold objective.
+
+    This API deliberately has no test arguments: only stored out-of-fold validation
+    labels and probabilities can influence the selected threshold.
+    """
+    if objective not in THRESHOLD_OBJECTIVES:
+        raise ValueError(
+            f"Unsupported threshold.objective: {objective!r}. "
+            f"Expected one of {sorted(THRESHOLD_OBJECTIVES)}."
+        )
+    if not isinstance(num_thresholds, int) or num_thresholds < 2:
+        raise ValueError(
+            "threshold.num_thresholds must be an integer >= 2, "
+            f"got {num_thresholds!r}"
+        )
+    if len(fold_predictions or {}) < 2:
+        raise ValueError("cv_common_threshold needs at least 2 folds")
+
+    prepared = {}
+    for fold, (y_true, y_prob) in sorted(fold_predictions.items()):
+        y_true = np.asarray(y_true)
+        y_prob = np.asarray(y_prob, dtype=float)
+        if y_true.ndim != 1 or y_prob.ndim != 1 or len(y_true) != len(y_prob):
+            raise ValueError(
+                f"fold {fold} labels and probabilities must be equal-length vectors"
+            )
+        if not np.all(np.isin(y_true, [0, 1])):
+            raise ValueError(f"fold {fold} contains labels outside {{0, 1}}")
+        if not np.all(np.isfinite(y_prob)) or np.any(
+            (y_prob < 0.0) | (y_prob > 1.0)
+        ):
+            raise ValueError(
+                f"fold {fold} probabilities must be finite and in [0, 1]"
+            )
+        prepared[fold] = (y_true.astype(int), y_prob)
+
+    grid = np.linspace(0.0, 1.0, num_thresholds)
+    rows = []
+    objective_curve = []
+    for threshold in grid:
+        fold_metrics = {
+            fold: _threshold_diagnostics(y_true, y_prob, float(threshold))
+            for fold, (y_true, y_prob) in prepared.items()
+        }
+
+        def aggregate(key):
+            values = [metrics[key] for metrics in fold_metrics.values()]
+            return float(np.mean(values)), float(np.std(values, ddof=1))
+
+        mean_objective, std_objective = aggregate(objective)
+        mean_balanced, std_balanced = aggregate("balanced_accuracy")
+        mean_sensitivity, std_sensitivity = aggregate("sensitivity")
+        mean_specificity, std_specificity = aggregate("specificity")
+        row = {
+            "threshold": float(threshold),
+            "mean_objective": mean_objective,
+            "std_objective": std_objective,
+            "mean_balanced_accuracy": mean_balanced,
+            "std_balanced_accuracy": std_balanced,
+            "mean_sensitivity": mean_sensitivity,
+            "std_sensitivity": std_sensitivity,
+            "mean_specificity": mean_specificity,
+            "std_specificity": std_specificity,
+        }
+        row.update(
+            {
+                f"fold_{fold}_balanced_accuracy": metrics["balanced_accuracy"]
+                for fold, metrics in fold_metrics.items()
+            }
+        )
+        rows.append(row)
+        objective_curve.append(mean_objective)
+
+    selected_index = threshold_tie_index(objective_curve, grid, tie_break)
+    selected = rows[selected_index]
+    threshold = selected["threshold"]
+    return {
+        "strategy": "cv_common_threshold",
+        "objective": objective,
+        "num_thresholds": num_thresholds,
+        "tie_break": tie_break,
+        "selected_index": selected_index,
+        "shared_threshold": threshold,
+        "fold_thresholds": {fold: threshold for fold in prepared},
+        "skipped_folds": [],
+        "mean_objective": selected["mean_objective"],
+        "std_objective": selected["std_objective"],
+        "mean_balanced_accuracy": selected["mean_balanced_accuracy"],
+        "std_balanced_accuracy": selected["std_balanced_accuracy"],
+        "mean_sensitivity": selected["mean_sensitivity"],
+        "std_sensitivity": selected["std_sensitivity"],
+        "mean_specificity": selected["mean_specificity"],
+        "std_specificity": selected["std_specificity"],
+        "curve": rows,
+    }
 
 
 def plateau_argmax(values, atol: float = 1e-12) -> int:
@@ -397,6 +610,10 @@ def select_cv_thresholds(
     fpr_rounding: str = DEFAULT_FPR_ROUNDING,
     fpr_grid: int = 101,
     threshold_grid: int = 0,
+    objective: str = DEFAULT_THRESHOLD_OBJECTIVE,
+    num_thresholds: int = DEFAULT_NUM_THRESHOLDS,
+    tie_break: str = DEFAULT_THRESHOLD_TIE_BREAK,
+    fixed_value: float = None,
 ) -> dict:
     """One operating point per fold, under the configured strategy.
 
@@ -410,7 +627,7 @@ def select_cv_thresholds(
     """
     if strategy not in CV_THRESHOLD_STRATEGIES:
         raise ValueError(
-            f"Unsupported threshold.cv_strategy: {strategy!r}. "
+            f"Unsupported threshold.strategy/threshold.cv_strategy: {strategy!r}. "
             f"Expected one of {sorted(CV_THRESHOLD_STRATEGIES)}."
         )
 
@@ -424,6 +641,23 @@ def select_cv_thresholds(
             "skipped_folds": [],
         }
 
+    if strategy == "fixed":
+        if (
+            fixed_value is None
+            or not np.isfinite(fixed_value)
+            or not 0.0 <= fixed_value <= 1.0
+        ):
+            raise ValueError("fixed threshold strategy needs threshold.value in [0, 1]")
+        folds = set((fold_predictions or {}).keys()) | set(
+            (fold_stored_thresholds or {}).keys()
+        )
+        return {
+            "strategy": strategy,
+            "shared_threshold": float(fixed_value),
+            "fold_thresholds": {fold: float(fixed_value) for fold in sorted(folds)},
+            "skipped_folds": [],
+        }
+
     if not fold_predictions:
         raise ValueError(f"{strategy} needs each fold's validation predictions")
 
@@ -431,8 +665,15 @@ def select_cv_thresholds(
         return vertical_average_operating_point(
             fold_predictions, fpr_grid=fpr_grid, rounding=fpr_rounding
         )
-    return threshold_average_operating_point(
-        fold_predictions, threshold_grid=threshold_grid
+    if strategy == "threshold_average":
+        return threshold_average_operating_point(
+            fold_predictions, threshold_grid=threshold_grid
+        )
+    return common_threshold_operating_point(
+        fold_predictions,
+        objective=objective,
+        num_thresholds=num_thresholds,
+        tie_break=tie_break,
     )
 
 
@@ -494,13 +735,20 @@ def compute_metrics(
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
     specificity = tn / (tn + fp) if (tn + fp) else 0.0
+    sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
+    npv = tn / (tn + fn) if (tn + fn) else 0.0
+    fpr = fp / (fp + tn) if (fp + tn) else 0.0
 
-    try:
-        roc_auc = roc_auc_score(y_true, y_prob)
-        average_precision = average_precision_score(y_true, y_prob)
-    except ValueError:
+    if len(np.unique(y_true)) < 2:
         roc_auc = None
         average_precision = None
+    else:
+        try:
+            roc_auc = roc_auc_score(y_true, y_prob)
+            average_precision = average_precision_score(y_true, y_prob)
+        except ValueError:
+            roc_auc = None
+            average_precision = None
 
     # Every scalar is cast to a plain float: sklearn hands back numpy scalars, which
     # torch.load rejects under its weights_only default when they reach metadata.pth.
@@ -511,10 +759,12 @@ def compute_metrics(
             None if average_precision is None else float(average_precision)
         ),
         "accuracy": float(accuracy_score(y_true, y_pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float((sensitivity + specificity) / 2.0),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-        "sensitivity": float(recall_score(y_true, y_pred, zero_division=0)),
+        "sensitivity": float(sensitivity),
         "specificity": float(specificity),
+        "npv": float(npv),
+        "fpr": float(fpr),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
         "confusion_matrix": cm.tolist(),
         "predicted_positive_rate": float(y_pred.mean()),
@@ -561,7 +811,7 @@ def aggregate_fold_metrics(fold_metrics: list[dict]):
     return aggregate
 
 
-def to_wandb_logs(metrics: dict, prefix: str, keys=VALIDATION_LOG_METRICS):
+def to_wandb_logs(metrics: dict, prefix: str, keys=EPOCH_LOG_METRICS):
     return {
         f"{prefix} {WANDB_METRIC_LABELS[key]}": metrics[key]
         for key in keys
