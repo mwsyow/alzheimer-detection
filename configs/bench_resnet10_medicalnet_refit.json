@@ -1,0 +1,110 @@
+{
+  "epochs": 60,
+  "device": "auto",
+  "wandb_entity": null,
+  "wandb_project": "alzheimer-detection",
+  "wandb_mode": "online",
+  "wandb_name": "bench-resnet10-medicalnet",
+  "dataset": {
+    "name": "oasis",
+    "image_glob": "data/T88_111_masked/*masked_gfc.img",
+    "label_path": "data/oasis_cross-sectional_cdr_cleaned.xlsx"
+  },
+  "model": {
+    "name": "ResNet10",
+    "params": {
+      "num_classes": 2,
+      "in_channels": 1,
+      "spatial_dims": 3,
+      "shortcut_type": "B",
+      "widen_factor": 1.0,
+      "bias_downsample": false,
+      "conv1_t_size": 7,
+      "conv1_t_stride": 2,
+      "no_max_pool": false,
+      "feed_forward": true
+    },
+    "pretrained": {
+      "enabled": true,
+      "source": "medicalnet",
+      "freeze_backbone": false
+    }
+  },
+  "loss": {
+    "name": "CrossEntropyLoss",
+    "params": {
+      "label_smoothing": 0.0
+    }
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "params": {
+      "lr": 0.0001,
+      "weight_decay": 0.01
+    }
+  },
+  "transforms": {
+    "resize": true,
+    "spatial_size": [
+      96,
+      128,
+      96
+    ],
+    "resize_mode": "trilinear",
+    "scale_intensity": false,
+    "normalize_intensity": true,
+    "normalize_nonzero": true,
+    "normalize_channel_wise": true,
+    "rand_rotate90": false,
+    "rand_flip": false,
+    "rand_affine": false,
+    "rand_bias_field": false,
+    "rand_gaussian_noise": false,
+    "rand_scale_intensity": false,
+    "rand_shift_intensity": false
+  },
+  "split": {
+    "train_size": 0.7,
+    "val_size": 0.15,
+    "test_size": 0.15,
+    "random_seed": 42
+  },
+  "cv": {
+    "enabled": false,
+    "n_splits": 5,
+    "shuffle": true,
+    "random_seed": 42
+  },
+  "refit": {
+    "enabled": true
+  },
+  "dataloader": {
+    "batch_size": 8,
+    "num_workers": 4
+  },
+  "checkpoint": {
+    "dir": "checkpoints",
+    "save_last": true,
+    "save_best": true,
+    "best_filename": "best_epoch_{epoch:03d}.pth",
+    "last_filename": "last.pth",
+    "monitor": "val_auc",
+    "mode": "max",
+    "min_delta": 0.0
+  },
+  "early_stopping": {
+    "enabled": false,
+    "patience": 10
+  },
+  "threshold": {
+    "strategy": "cv_common_threshold",
+    "objective": "balanced_accuracy",
+    "num_thresholds": 1000,
+    "tie_break": "plateau_midpoint"
+  },
+  "evaluation": {
+    "output_dir": "evaluations",
+    "log_wandb": false,
+    "save_predictions": true
+  }
+}
