@@ -1,11 +1,11 @@
 import argparse
 import copy
-import csv
 import json
 import math
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-import numpy as np
 import torch
 from dotenv import load_dotenv
 from monai.data import DataLoader
@@ -34,10 +34,8 @@ from metrics import (
     collect_predictions,
     pack_predictions,
     ranking_metrics,
-    select_cv_thresholds,
     summarize_predictions,
     to_wandb_logs,
-    unpack_prediction_bundle,
 )
 from models import build_model
 
@@ -69,6 +67,7 @@ MONITOR_SUMMARY_KEYS = {
 # Cross-validation layout: checkpoints/<run_id>/split_<k>/best_model.pth
 FOLD_DIR_TEMPLATE = "split_{fold}"
 CV_BEST_FILENAME = "best_model.pth"
+WANDB_NAME_TIMEZONE = ZoneInfo("Europe/Berlin")
 # Deliberately not one of MONITOR_SUMMARY_KEYS: only the parent writes the sweep
 # objective, so fold runs can never win sweep.best_run().
 FOLD_SUMMARY_KEY = "Fold Best Validation Metric"
@@ -135,21 +134,12 @@ def normalize_threshold_config(
             if legacy_grid not in (None, 0)
             else DEFAULT_NUM_THRESHOLDS
         )
-        block["tie_break"] = block.get(
-            "tie_break", DEFAULT_THRESHOLD_TIE_BREAK
-        )
+        block["tie_break"] = block.get("tie_break", DEFAULT_THRESHOLD_TIE_BREAK)
         if block["objective"] not in THRESHOLD_OBJECTIVES:
-            raise ValueError(
-                f"Unsupported threshold.objective: {block['objective']!r}"
-            )
+            raise ValueError(f"Unsupported threshold.objective: {block['objective']!r}")
         if block["tie_break"] not in THRESHOLD_TIE_BREAKS:
-            raise ValueError(
-                f"Unsupported threshold.tie_break: {block['tie_break']!r}"
-            )
-        if (
-            not isinstance(block["num_thresholds"], int)
-            or block["num_thresholds"] < 2
-        ):
+            raise ValueError(f"Unsupported threshold.tie_break: {block['tie_break']!r}")
+        if not isinstance(block["num_thresholds"], int) or block["num_thresholds"] < 2:
             raise ValueError("threshold.num_thresholds must be an integer >= 2")
     elif strategy == "fixed":
         value = block.get("value")
@@ -233,6 +223,22 @@ def get_checkpoint_dir(run: wandb.Run, config) -> Path:
     return checkpoint_dir
 
 
+def timestamp_wandb_name(base_name: str | None, now: datetime | None = None):
+    """Append one Europe/Berlin timestamp to a fresh parent run name.
+
+    Fold names derive from the resolved parent name. Resumed runs never call this
+    helper, so they keep the original parent and fold names.
+    """
+    if not base_name:
+        return None
+    current = now or datetime.now(WANDB_NAME_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=WANDB_NAME_TIMEZONE)
+    else:
+        current = current.astimezone(WANDB_NAME_TIMEZONE)
+    return f"{base_name}-{current.strftime('%Y%m%d-%H%M%S')}"
+
+
 def save_metadata(
     checkpoint_dir: Path,
     run: wandb.Run,
@@ -243,6 +249,7 @@ def save_metadata(
         {
             "run_id": run.id,
             "sweep_id": run.sweep_id,
+            "wandb_run_name": run.name,
             "config": dict(config),
             "split": split_indices,
         },
@@ -510,7 +517,9 @@ def train(
 
     return {
         "fold": fold,
-        "best_monitor_value": best_monitor_value if math.isfinite(best_monitor_value) else None,
+        "best_monitor_value": best_monitor_value
+        if math.isfinite(best_monitor_value)
+        else None,
         "best_result": best_result,
         "early_stopping_counter": early_stopping_counter,
         # The last epoch's training metrics. For a refit run this is the only read on
@@ -556,9 +565,7 @@ def build_optimizer(config, model):
     ]
     if not trainable_parameters:
         raise ValueError("Model has no trainable parameters")
-    return torch.optim.AdamW(
-        trainable_parameters, **optimizer_config.get("params", {})
-    )
+    return torch.optim.AdamW(trainable_parameters, **optimizer_config.get("params", {}))
 
 
 def resolve_device(config) -> torch.device:
@@ -660,10 +667,12 @@ def log_cv_aggregate(parent: wandb.Run, cv_state: dict, monitor_name: str):
     if monitor_key in aggregate["mean"]:
         # Same flat scalar name the single-split path writes, so sweep configs are
         # identical for CV and non-CV runs.
-        parent.summary[MONITOR_SUMMARY_KEYS[monitor_name]] = aggregate["mean"][monitor_key]
-        parent.summary[
-            MONITOR_SUMMARY_KEYS[monitor_name].replace("Best ", "Std ")
-        ] = aggregate["std"][monitor_key]
+        parent.summary[MONITOR_SUMMARY_KEYS[monitor_name]] = aggregate["mean"][
+            monitor_key
+        ]
+        parent.summary[MONITOR_SUMMARY_KEYS[monitor_name].replace("Best ", "Std ")] = (
+            aggregate["std"][monitor_key]
+        )
 
     parent.summary["CV Completed Folds"] = len(ordered)
     parent.summary["CV Fold Best Epochs"] = [r.get("epoch") for r in ordered]
@@ -678,171 +687,12 @@ def save_cv_metadata(checkpoint_dir: Path, run: wandb.Run, config, cv_state: dic
         {
             "run_id": run.id,
             "sweep_id": run.sweep_id,
+            "wandb_run_name": run.name,
             "config": dict(config),
             "cv": cv_state,
         },
         checkpoint_dir / "metadata.pth",
     )
-
-
-def load_verified_oof_predictions(
-    checkpoint_dir: Path,
-    cv_state: dict,
-    dataset_items: list[dict],
-    require_indices: bool = True,
-) -> dict:
-    """Load selected fold predictions and prove that they are out-of-fold."""
-    test = set(cv_state["test_idx"])
-    expected_development = set(range(len(dataset_items))) - test
-    tiled_validation = set()
-    predictions = {}
-
-    for fold_number, fold in enumerate(cv_state["folds"], start=1):
-        path = fold_dir(checkpoint_dir, fold_number) / CV_BEST_FILENAME
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Selected checkpoint missing for fold {fold_number}: {path}"
-            )
-        checkpoint = torch.load(path, map_location="cpu")
-        packed = checkpoint.get("val_predictions")
-        if packed is None:
-            raise ValueError(f"{path} stores no validation predictions")
-        y_true, y_prob, saved_indices = unpack_prediction_bundle(packed)
-
-        train_indices = list(fold["train_idx"])
-        val_indices = list(fold["val_idx"])
-        train_set, val_set = set(train_indices), set(val_indices)
-        if train_set & val_set:
-            raise ValueError(
-                f"fold {fold_number} has overlapping train and validation indices"
-            )
-        if (train_set | val_set) & test:
-            raise ValueError(
-                f"fold {fold_number} train/validation indices overlap the test set"
-            )
-        if tiled_validation & val_set:
-            raise ValueError("fold validation sets are not disjoint")
-        tiled_validation.update(val_set)
-
-        if saved_indices is None:
-            if require_indices:
-                raise ValueError(
-                    f"{path} has no validation prediction indices; refusing a new "
-                    "common-threshold search because OOF provenance cannot be verified"
-                )
-        else:
-            saved = [int(index) for index in np.asarray(saved_indices).tolist()]
-            if saved != val_indices:
-                raise ValueError(
-                    f"fold {fold_number} saved prediction indices do not exactly "
-                    "match its ordered validation indices"
-                )
-            expected_labels = np.asarray(
-                [dataset_items[index]["label"] for index in saved], dtype=int
-            )
-            if not np.array_equal(np.asarray(y_true, dtype=int), expected_labels):
-                raise ValueError(
-                    f"fold {fold_number} prediction labels do not match dataset labels"
-                )
-
-        if len(y_true) != len(val_indices) or len(y_prob) != len(val_indices):
-            raise ValueError(
-                f"fold {fold_number} prediction count does not match validation count"
-            )
-        predictions[fold_number] = (y_true, y_prob)
-
-    if tiled_validation != expected_development:
-        missing = sorted(expected_development - tiled_validation)
-        extra = sorted(tiled_validation - expected_development)
-        raise ValueError(
-            "fold validation sets do not tile the development pool "
-            f"(missing={missing}, extra={extra})"
-        )
-    return predictions
-
-
-def _json_threshold_selection(selection: dict) -> dict:
-    """Drop the full curve and add the stable scalar name used by donors."""
-    summary = {key: value for key, value in selection.items() if key != "curve"}
-    if selection.get("shared_threshold") is not None:
-        summary["threshold"] = float(selection["shared_threshold"])
-    return summary
-
-
-def select_and_store_cv_threshold(
-    checkpoint_dir: Path,
-    run: wandb.Run,
-    config: dict,
-    cv_state: dict,
-    dataset_items: list[dict],
-) -> dict | None:
-    """Run post-CV threshold selection once and persist its reproducible artifacts."""
-    block = normalize_threshold_config(config)["threshold"]
-    strategy = block["strategy"]
-    if strategy == "per_fold_youden":
-        # Explicit old-checkpoint compatibility. New checkpoints deliberately contain
-        # no independently tuned fold threshold, so there is nothing to recompute here.
-        return None
-
-    predictions = load_verified_oof_predictions(
-        checkpoint_dir,
-        cv_state,
-        dataset_items,
-        require_indices=(strategy == "cv_common_threshold"),
-    )
-    selection = select_cv_thresholds(
-        strategy=strategy,
-        fold_predictions=predictions,
-        fpr_rounding=block.get("fpr_rounding", "at_least"),
-        fpr_grid=block.get("fpr_grid", 101),
-        threshold_grid=block.get("threshold_grid", 0),
-        objective=block.get("objective", DEFAULT_THRESHOLD_OBJECTIVE),
-        num_thresholds=block.get("num_thresholds", DEFAULT_NUM_THRESHOLDS),
-        tie_break=block.get("tie_break", DEFAULT_THRESHOLD_TIE_BREAK),
-        fixed_value=block.get("value"),
-    )
-    summary = _json_threshold_selection(selection)
-    curve = selection.get("curve", [])
-    selection_path = checkpoint_dir / "threshold_selection.json"
-    curve_path = checkpoint_dir / "threshold_curve.csv"
-
-    with selection_path.open("w") as handle:
-        json.dump(summary, handle, indent=2)
-    if curve:
-        with curve_path.open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(curve[0]))
-            writer.writeheader()
-            writer.writerows(curve)
-
-    artifacts = {
-        "threshold_selection": str(selection_path),
-        "threshold_curve": str(curve_path) if curve else None,
-    }
-    cv_state["threshold_selection"] = {**summary, "artifacts": artifacts}
-
-    if strategy == "cv_common_threshold":
-        run.log(
-            {
-                "CV Threshold Sweep": wandb.Table(
-                    columns=list(curve[0]),
-                    data=[[row[key] for key in curve[0]] for row in curve],
-                )
-            }
-        )
-        run.summary["cv_best_threshold"] = summary["threshold"]
-        run.summary["cv_threshold_objective"] = summary["objective"]
-        run.summary["cv_best_mean_objective"] = summary["mean_objective"]
-        run.summary["cv_best_std_objective"] = summary["std_objective"]
-        run.summary["cv_best_mean_balanced_accuracy"] = summary[
-            "mean_balanced_accuracy"
-        ]
-        run.summary["cv_best_std_balanced_accuracy"] = summary[
-            "std_balanced_accuracy"
-        ]
-    elif summary.get("threshold") is not None:
-        run.summary["cv_best_threshold"] = summary["threshold"]
-        run.summary["cv_threshold_objective"] = strategy
-    return selection
 
 
 def run_cross_validation(
@@ -907,9 +757,9 @@ def run_cross_validation(
 
         train_loader, val_loader = source.fold_loaders(fold)
         loss = build_loss(config)
-        model = build_model(
-            config, initialize_pretrained=fold_checkpoint is None
-        ).to(device)
+        model = build_model(config, initialize_pretrained=fold_checkpoint is None).to(
+            device
+        )
         optim = build_optimizer(config, model)
 
         epochs = config["epochs"]
@@ -964,14 +814,6 @@ def run_cross_validation(
         save_cv_metadata(checkpoint_dir, run, config, cv_state)
 
         log_fold_summary(run, fold_number, result)
-
-    if len(cv_state["completed_folds"]) == len(cv_state["folds"]):
-        # Deliberately recomputed on completed resumes: the selected checkpoints are
-        # the source of truth, and both artifacts are deterministic replacements.
-        select_and_store_cv_threshold(
-            checkpoint_dir, run, config, cv_state, source.items
-        )
-        save_cv_metadata(checkpoint_dir, run, config, cv_state)
 
     log_cv_aggregate(run, cv_state, monitor_name)
     return cv_state
@@ -1044,8 +886,12 @@ def runner(
         # be identical across arms. Announced so the omission is visible, not assumed.
         checkpoint_config = {**checkpoint_config, "save_best": False}
         early_stopping_config = {}
-        ignored = ["checkpoint.save_best", "checkpoint.monitor", "checkpoint.mode",
-                   "checkpoint.min_delta"]
+        ignored = [
+            "checkpoint.save_best",
+            "checkpoint.monitor",
+            "checkpoint.mode",
+            "checkpoint.min_delta",
+        ]
         if config["early_stopping"].get("enabled", False):
             ignored.append("early_stopping")
         print(
@@ -1081,7 +927,9 @@ def runner(
         final = result.get("final_train_metrics") or {}
         for key in EPOCH_LOG_METRICS:
             if final.get(key) is not None:
-                run.summary[f"Refit Final Training {WANDB_METRIC_LABELS[key]}"] = final[key]
+                run.summary[f"Refit Final Training {WANDB_METRIC_LABELS[key]}"] = final[
+                    key
+                ]
 
     return result
 
@@ -1127,10 +975,17 @@ def main():
     else:
         config = load_config(args.config)
 
+    resolved_name = None
+    if args.resume is None:
+        resolved_name = timestamp_wandb_name(config.get("wandb_name"))
+    elif metadata is not None:
+        resolved_name = metadata.get("wandb_run_name")
+    if resolved_name is not None:
+        wandb_init_kwargs["name"] = resolved_name
+
     wandb_run = wandb.init(
         entity=config["wandb_entity"],
         project=config["wandb_project"],
-        name=config.get("wandb_name"),
         mode=config["wandb_mode"],
         config=config,
         **wandb_init_kwargs,

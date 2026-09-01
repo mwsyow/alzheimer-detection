@@ -6,7 +6,14 @@ import numpy as np
 import pytest
 import torch
 
-from evaluate import validate_donor_refit_compatibility
+from evaluate import (
+    load_fold_validation_predictions,
+    log_threshold_selection,
+    persist_cv_threshold_selection,
+    select_with_threshold_config,
+    threshold_definition_from_block,
+    validate_donor_refit_compatibility,
+)
 from metrics import (
     common_threshold_operating_point,
     compute_metrics,
@@ -16,11 +23,7 @@ from metrics import (
     unpack_prediction_bundle,
 )
 from models import Simple3DCNN
-from train import (
-    load_verified_oof_predictions,
-    normalize_threshold_config,
-    select_and_store_cv_threshold,
-)
+from train import normalize_threshold_config
 
 
 def synthetic_folds():
@@ -32,20 +35,15 @@ def synthetic_folds():
 
 
 def test_common_threshold_uniquely_selects_point_four():
-    selected = common_threshold_operating_point(
-        synthetic_folds(), num_thresholds=11
-    )
+    selected = common_threshold_operating_point(synthetic_folds(), num_thresholds=11)
     assert selected["shared_threshold"] == pytest.approx(0.4)
     assert all(
-        value == pytest.approx(0.4)
-        for value in selected["fold_thresholds"].values()
+        value == pytest.approx(0.4) for value in selected["fold_thresholds"].values()
     )
 
 
 def test_common_threshold_curve_has_required_diagnostics():
-    selected = common_threshold_operating_point(
-        synthetic_folds(), num_thresholds=11
-    )
+    selected = common_threshold_operating_point(synthetic_folds(), num_thresholds=11)
     assert len(selected["curve"]) == 11
     required = {
         "threshold",
@@ -102,7 +100,6 @@ def test_npv_and_fpr_zero_denominators_are_zero():
     metrics = compute_metrics(y_true=[1, 1], y_prob=[0.8, 0.9], threshold=0.5)
     assert metrics["npv"] == 0.0
     assert metrics["fpr"] == 0.0
-
 
 
 def test_prediction_unpacking_remains_backward_compatible():
@@ -163,12 +160,20 @@ def write_verified_folds(tmp_path):
 
 def test_oof_provenance_accepts_exact_tiling_and_rejects_overlap(tmp_path):
     items, state = write_verified_folds(tmp_path)
-    predictions = load_verified_oof_predictions(tmp_path, state, items)
+    fold_paths = {
+        fold: tmp_path / f"split_{fold}" / "best_model.pth" for fold in (1, 2)
+    }
+    predictions, _, provenance = load_fold_validation_predictions(
+        fold_paths, cv_state=state, dataset_items=items
+    )
     assert set(predictions) == {1, 2}
+    assert provenance["status"] == "verified_indexed"
 
     state["folds"][0]["train_idx"].append(0)
     with pytest.raises(ValueError, match="overlapping train and validation"):
-        load_verified_oof_predictions(tmp_path, state, items)
+        load_fold_validation_predictions(
+            fold_paths, cv_state=state, dataset_items=items
+        )
 
 
 def compatible_metadata():
@@ -221,6 +226,38 @@ def test_donor_refit_compatibility_rejects_recipe_and_partition_drift():
 
 def test_threshold_artifacts_round_trip_as_csv_and_json(tmp_path, monkeypatch):
     items, state = write_verified_folds(tmp_path)
+    fold_paths = {
+        fold: tmp_path / f"split_{fold}" / "best_model.pth" for fold in (1, 2)
+    }
+    predictions, _, provenance = load_fold_validation_predictions(
+        fold_paths, cv_state=state, dataset_items=items
+    )
+    threshold_config = {
+        "strategy": "cv_common_threshold",
+        "objective": "balanced_accuracy",
+        "num_thresholds": 11,
+        "tie_break": "plateau_midpoint",
+        "fpr_rounding": "at_least",
+        "fpr_grid": 101,
+        "threshold_grid": 0,
+        "value": None,
+    }
+    selection = select_with_threshold_config(
+        fold_paths, threshold_config, fold_predictions=predictions
+    )
+    stored = persist_cv_threshold_selection(
+        tmp_path,
+        selection,
+        threshold_definition_from_block(threshold_config),
+        provenance,
+    )
+    with (tmp_path / "threshold_selection.json").open() as handle:
+        on_disk = json.load(handle)
+    with (tmp_path / "threshold_curve.csv").open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert on_disk["threshold"] == selection["shared_threshold"]
+    assert stored["provenance"]["status"] == "verified_indexed"
+    assert len(rows) == 11
 
     class Run:
         def __init__(self):
@@ -230,28 +267,9 @@ def test_threshold_artifacts_round_trip_as_csv_and_json(tmp_path, monkeypatch):
         def log(self, values):
             self.logged.update(values)
 
-    monkeypatch.setattr("train.wandb.Table", lambda **kwargs: kwargs)
+    monkeypatch.setattr("evaluate.wandb.Table", lambda **kwargs: kwargs)
     run = Run()
-    selection = select_and_store_cv_threshold(
-        tmp_path,
-        run,
-        {
-            "threshold": {
-                "strategy": "cv_common_threshold",
-                "objective": "balanced_accuracy",
-                "num_thresholds": 11,
-                "tie_break": "plateau_midpoint",
-            }
-        },
-        state,
-        items,
-    )
-    with (tmp_path / "threshold_selection.json").open() as handle:
-        stored = json.load(handle)
-    with (tmp_path / "threshold_curve.csv").open() as handle:
-        rows = list(csv.DictReader(handle))
-    assert stored["threshold"] == selection["shared_threshold"]
-    assert len(rows) == 11
+    log_threshold_selection(run, selection)
     assert "CV Threshold Sweep" in run.logged
 
 

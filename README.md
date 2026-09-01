@@ -56,16 +56,22 @@ uv run python train.py --resume checkpoints/<wandb_run_id>/best_epoch_003.pth
 
 ## Test Evaluation
 
-Select the operating threshold from CV, train a fresh refit for its explicitly configured
-epoch count, then evaluate that refit's `last.pth` with the stored CV threshold:
+Generate a refit config from the completed CV run, train it, then evaluate its
+`last.pth`. Evaluation calculates the threshold from the CV run's saved best-fold
+validation labels and probabilities (or reuses an identical previously calculated
+selection):
 
 ```bash
 uv run python train.py --config configs/<cv-config>.json
-uv run python train.py --config configs/<refit-config>.json
+uv run python generate_refit_config.py --cv-run checkpoints/<cv_run_id>
+uv run python train.py --config configs/<generated-refit-config>.json
 uv run python evaluate.py \
   --checkpoint checkpoints/<refit_run_id>/last.pth \
   --threshold-from checkpoints/<cv_run_id>
 ```
+
+Here `<cv_run_id>` is the parent CV trial's W&B run ID—the directory name under
+`checkpoints/`—not its W&B group ID or sweep ID.
 
 Add `--device cpu` or `--device cuda` to choose a device, and `--log-wandb` to attach
 the final metrics to the refit run. Direct CV-directory test evaluation is diagnostic

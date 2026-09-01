@@ -8,6 +8,7 @@ silently goes, so it is asserted directly rather than left to inspection.
 
 import argparse
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -306,7 +307,9 @@ def test_packing_does_not_carry_the_whole_source_buffer(tmp_path):
 
 def test_unpack_accepts_numpy_as_well_as_tensors(folds):
     y_true, y_prob = folds[1]
-    restored_true, restored_prob = unpack_predictions({"y_true": y_true, "y_prob": y_prob})
+    restored_true, restored_prob = unpack_predictions(
+        {"y_true": y_true, "y_prob": y_prob}
+    )
     assert np.array_equal(restored_true, y_true)
     assert restored_prob == pytest.approx(y_prob)
 
@@ -366,7 +369,9 @@ def test_eval_config_applies_allowlisted_keys(trained_metadata, tmp_path):
     assert report["overridden"] == ["threshold"]
 
 
-def test_eval_config_refuses_to_change_how_the_model_computes(trained_metadata, tmp_path):
+def test_eval_config_refuses_to_change_how_the_model_computes(
+    trained_metadata, tmp_path
+):
     """The failure this allowlist exists to prevent: silently rescored on other inputs."""
     path = write_config(
         tmp_path,
@@ -381,7 +386,9 @@ def test_eval_config_refuses_to_change_how_the_model_computes(trained_metadata, 
     assert sorted(report["ignored_differing"]) == ["model", "transforms"]
 
 
-def test_eval_config_stays_quiet_when_ignored_keys_match(trained_metadata, tmp_path, capsys):
+def test_eval_config_stays_quiet_when_ignored_keys_match(
+    trained_metadata, tmp_path, capsys
+):
     """Passing the very config that trained the run must not produce noise."""
     path = write_config(tmp_path, dict(trained_metadata["config"]))
     _, report = resolve_eval_config(trained_metadata, path)
@@ -405,21 +412,47 @@ def test_eval_config_does_not_mutate_the_metadata(trained_metadata, tmp_path):
 # ------------------------------------------------------- the cut a single model inherits
 
 
+@pytest.fixture
+def donor_source(monkeypatch):
+    """Build only the dataset item list needed for OOF provenance checks."""
+    monkeypatch.setattr(
+        "evaluate.build_dataset_source",
+        lambda config: SimpleNamespace(items=config["_test_items"]),
+    )
+
+
 def write_cv_run(tmp_path, folds, thresholds=None, config=None):
-    """A minimal cross-validation run directory: per-fold checkpoints plus metadata."""
-    for fold, (y_true, y_prob) in folds.items():
+    """A minimal CV run whose fold predictions tile one development pool."""
+    labels = []
+    validation_ranges = {}
+    for fold, (y_true, _) in sorted(folds.items()):
+        start = len(labels)
+        labels.extend(int(label) for label in y_true)
+        validation_ranges[fold] = list(range(start, len(labels)))
+
+    development = set(range(len(labels)))
+    metadata_folds = []
+    for fold, (y_true, y_prob) in sorted(folds.items()):
         fold_dir = tmp_path / f"split_{fold}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         payload = {"fold": fold, "val_predictions": pack_predictions(y_true, y_prob)}
         if thresholds is not None:
             payload["threshold"] = thresholds[fold]
         torch.save(payload, fold_dir / "best_model.pth")
+        val_idx = validation_ranges[fold]
+        metadata_folds.append(
+            {"train_idx": sorted(development - set(val_idx)), "val_idx": val_idx}
+        )
 
+    test_idx = [len(labels), len(labels) + 1]
+    items = [{"label": label} for label in labels + [0, 1]]
+    run_config = dict(config or {"threshold": {"cv_strategy": "vertical_average"}})
+    run_config["_test_items"] = items
     torch.save(
         {
             "run_id": "donor001",
-            "config": config or {"threshold": {"cv_strategy": "vertical_average"}},
-            "cv": {"test_idx": [0, 1, 2], "folds": []},
+            "config": run_config,
+            "cv": {"test_idx": test_idx, "folds": metadata_folds},
         },
         tmp_path / "metadata.pth",
     )
@@ -436,7 +469,7 @@ def threshold_args(**overrides):
     return argparse.Namespace(**{**defaults, **overrides})
 
 
-def test_the_inherited_cut_is_the_ensembles_own(tmp_path, folds):
+def test_the_inherited_cut_is_the_ensembles_own(tmp_path, folds, donor_source):
     """Benchmark 2 must score the single model at exactly benchmark 1's operating point.
 
     Computed here the long way -- select, then take the ensemble's cut -- and compared
@@ -449,9 +482,9 @@ def test_the_inherited_cut_is_the_ensembles_own(tmp_path, folds):
     # nothing about whether the two benchmarks agree.
     round_tripped = {
         fold: unpack_predictions(
-            torch.load(run_dir / f"split_{fold}" / "best_model.pth", weights_only=False)[
-                "val_predictions"
-            ]
+            torch.load(
+                run_dir / f"split_{fold}" / "best_model.pth", weights_only=False
+            )["val_predictions"]
         )
         for fold in folds
     }
@@ -464,7 +497,7 @@ def test_the_inherited_cut_is_the_ensembles_own(tmp_path, folds):
     assert record["threshold_source"] == phrase
 
 
-def test_the_inherited_cut_records_where_it_came_from(tmp_path, folds):
+def test_the_inherited_cut_records_where_it_came_from(tmp_path, folds, donor_source):
     """An operating point borrowed from another run is only defensible if it is traceable."""
     run_dir = write_cv_run(tmp_path, folds)
     _, record = inherited_operating_point(run_dir, threshold_args())
@@ -474,15 +507,26 @@ def test_the_inherited_cut_records_where_it_came_from(tmp_path, folds):
     assert record["folds_used"] == sorted(folds)
     assert record["cv_selection"]["strategy"] == "vertical_average"
     assert "target_fpr" in record["cv_selection"]
+    assert record["cv_selection"]["provenance"]["status"] == "verified_legacy_unindexed"
 
 
-def test_the_inherited_cut_uses_the_donors_own_strategy(tmp_path, folds):
-    """The donor's config decides, so the number reproduces that run's own summary.json."""
+def test_the_inherited_cut_uses_the_evaluation_strategy(tmp_path, folds, donor_source):
+    """Saved probabilities can be analyzed with the refit's threshold policy."""
     run_dir = write_cv_run(
         tmp_path, folds, config={"threshold": {"cv_strategy": "threshold_average"}}
     )
-    _, record = inherited_operating_point(run_dir, threshold_args())
-    assert record["cv_selection"]["strategy"] == "threshold_average"
+    evaluation_config = {
+        "threshold": {
+            "strategy": "cv_common_threshold",
+            "objective": "balanced_accuracy",
+            "num_thresholds": 11,
+            "tie_break": "plateau_midpoint",
+        }
+    }
+    _, record = inherited_operating_point(
+        run_dir, threshold_args(), selection_config=evaluation_config
+    )
+    assert record["cv_selection"]["strategy"] == "cv_common_threshold"
 
 
 def test_inheriting_from_a_directory_with_no_folds_raises(tmp_path):

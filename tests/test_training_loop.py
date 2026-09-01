@@ -12,6 +12,10 @@ Second, that a refit run -- no validation split at all -- neither crashes nor si
 fabricates the quantities it cannot measure.
 """
 
+from datetime import datetime
+from types import SimpleNamespace
+
+
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -20,10 +24,14 @@ import pytest
 
 from conftest import FakeRun
 from metrics import unpack_predictions
-from train import train
+from train import start_fold_run, timestamp_wandb_name, train
 
 EXPECTED_TRAIN_KEYS = {"Training Loss", "Training AUC", "Training Average Precision"}
-EXPECTED_VAL_KEYS = {"Validation Loss", "Validation AUC", "Validation Average Precision"}
+EXPECTED_VAL_KEYS = {
+    "Validation Loss",
+    "Validation AUC",
+    "Validation Average Precision",
+}
 
 CHECKPOINT_CONFIG = {
     "monitor": "val_auc",
@@ -51,7 +59,9 @@ def model() -> nn.Module:
     return nn.Sequential(nn.Flatten(), nn.Linear(64, 2))
 
 
-def run_epochs(tmp_path, epochs=1, with_validation=True, checkpoint_config=None, **kwargs):
+def run_epochs(
+    tmp_path, epochs=1, with_validation=True, checkpoint_config=None, **kwargs
+):
     net = model()
     logger = FakeRun()
     result = train(
@@ -84,8 +94,15 @@ def test_no_thresholded_metric_is_reported(tmp_path):
     _, logger = run_epochs(tmp_path)
     (logged,) = logger.log_calls
     labels = {key.split(" ", 1)[1] for key in logged if key != "Epoch"}
-    for banned in ("Balanced Accuracy", "Accuracy", "F1", "Precision", "Sensitivity",
-                   "Specificity", "Threshold"):
+    for banned in (
+        "Balanced Accuracy",
+        "Accuracy",
+        "F1",
+        "Precision",
+        "Sensitivity",
+        "Specificity",
+        "Threshold",
+    ):
         assert banned not in labels, f"{banned} is back"
 
 
@@ -174,3 +191,41 @@ def test_a_refit_run_without_save_last_is_refused(tmp_path):
         run_epochs(
             tmp_path, with_validation=False, checkpoint_config={"save_last": False}
         )
+
+
+def test_wandb_name_gets_one_berlin_timestamp():
+    moment = datetime(2026, 9, 1, 14, 30, 52)
+    assert timestamp_wandb_name("bench-simple3dcnn", moment) == (
+        "bench-simple3dcnn-20260901-143052"
+    )
+    assert timestamp_wandb_name(None, moment) is None
+
+
+def test_every_cv_fold_reuses_the_timestamped_parent_name(monkeypatch):
+    calls = {}
+    settings = SimpleNamespace(sweep_id="sweep123")
+    monkeypatch.setattr("train.wandb.setup", lambda: SimpleNamespace(settings=settings))
+    monkeypatch.setattr("train.wandb.util.generate_id", lambda: "child001")
+
+    def fake_init(**kwargs):
+        calls.update(kwargs)
+        return FakeRun(name=kwargs["name"], run_id=kwargs["id"])
+
+    monkeypatch.setattr("train.wandb.init", fake_init)
+    parent = FakeRun(name="bench-simple3dcnn-20260901-143052")
+    child = start_fold_run(
+        parent,
+        {
+            "wandb_entity": "entity",
+            "wandb_project": "project",
+            "wandb_mode": "disabled",
+        },
+        {"group_id": "group001", "fold_run_ids": {}},
+        fold_number=3,
+        fold_checkpoint=None,
+    )
+
+    assert child.name == "bench-simple3dcnn-20260901-143052-fold3"
+    assert calls["name"] == child.name
+    assert calls["group"] == "group001"
+    assert settings.sweep_id == "sweep123"

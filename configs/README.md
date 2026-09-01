@@ -180,8 +180,10 @@ skips completed ones:
 uv run python train.py --config configs/my_config.json --resume checkpoints/<run_id>
 ```
 
-wandb gets one parent run (aggregate + sweep objective) plus one child per fold
-(per-epoch curves), sharing a group.
+wandb gets one timestamped parent run (aggregate + sweep objective) plus one child per
+fold (per-epoch curves), sharing a group. A configured name such as `experiment` becomes
+`experiment-20260901-143052`; every child reuses it as
+`experiment-20260901-143052-fold1`, `...-fold2`, and so on.
 
 ## `refit`
 
@@ -221,12 +223,29 @@ and friends are the only read on how the model ended up.
 **Choosing `epochs`.** There is no validation curve, so this is a plain config value that
 has to be justified. Take it from the same architecture's CV run — its per-fold best
 epochs are in `metadata["cv"]["fold_results"][k]["epoch"]` and in the `CV Fold Best
-Epochs` summary key — using `round(mean) + 1`, or `median + 1` when one fold is an
-outlier the mean would let dominate. The `+1` turns a 0-indexed epoch into a count.
+Epochs` summary key. First add one to turn each 0-indexed epoch into a training count,
+then take the median (recommended) or mean and round halves up to an integer.
 Never use the maximum: that is one fold's luckiest epoch, which is exactly the
 overfitting a refit cannot detect. A benchmark protocol's budget is also wrong here — a
 fixed 60 exists to give every arm equal draws at a max-over-epochs objective, and a refit
 takes no max.
+
+Generate the refit recipe directly from a completed CV run. Median is the robust default;
+use `--epoch-rule mean` when that aggregation is intentional:
+
+```bash
+uv run python generate_refit_config.py --cv-run checkpoints/<cv_run_id>
+uv run python generate_refit_config.py --cv-run checkpoints/<cv_run_id> \
+    --epoch-rule mean --output configs/my_refit.json
+```
+
+The generator copies the resolved hyperparameters actually stored by the CV trial,
+disables CV and early stopping, enables refit, appends `-refit` to `wandb_name`, and
+replaces legacy threshold settings with the current common-threshold definition. By
+default it writes `configs/<wandb_name>_refit.json`, refuses to overwrite an existing
+file without `--force`, and prints both fold statistics plus the training and evaluation
+commands. A warning means at least one fold peaked at the CV budget boundary, so its
+recommended refit duration may be censored.
 
 Read the number off the CV run of **this** architecture, not a similar one. An epoch
 budget does not transfer between different networks: the two DenseNet arms are the same
@@ -234,8 +253,9 @@ network differing only in whether pretrained weights load, and the pretrained on
 around epoch 4-8 precisely because it starts trained, where a scratch run needs far
 longer. Nothing downstream would catch the swap, since a refit has no validation split.
 
-**Threshold.** A refit has no held-out data to choose an operating point on, so it borrows
-the one its CV sibling's ensemble used:
+**Threshold.** A refit has no held-out data to choose an operating point on. During final
+evaluation it derives one from its CV sibling's saved best-fold validation labels and
+probabilities:
 
 ```bash
 uv run python evaluate.py --checkpoint checkpoints/<refit_run>/last.pth \
@@ -274,8 +294,9 @@ swing hard between epochs, and a real best epoch can arrive late.
 
 ## `threshold`
 
-Read after cross-validation and by [`evaluate.py`](../evaluate.py) — how a CV run turns
-its stored out-of-fold predictions into one decision threshold.
+Read by [`evaluate.py`](../evaluate.py) — how evaluation turns a completed CV run's
+stored best-fold validation labels and probabilities into one decision threshold.
+Training does not calculate or require this threshold.
 
 ```json
 "threshold": {
@@ -301,9 +322,10 @@ its stored out-of-fold predictions into one decision threshold.
 **`cv_common_threshold`** evaluates the same numerical candidate on every fold's
 out-of-fold probabilities, averages the configured objective across folds, and chooses
 one cut from that mean curve. It never optimises folds separately and never sees the
-test set. Completed CV runs write `threshold_curve.csv` and `threshold_selection.json`
-beside `metadata.pth`; a fresh refit inherits the stored cut exactly with
-`--threshold-from`.
+test set. The first evaluation that needs the cut writes `threshold_curve.csv` and
+`threshold_selection.json` beside the donor's `metadata.pth`; later evaluations reuse the
+stored cut only when the complete threshold definition matches. A fresh refit triggers
+this calculation with `--threshold-from`.
 
 **`vertical_average`** (Fawcett 2006, Alg. 3) averages the folds' TPR over a shared
 false-positive-rate axis, picks the target FPR maximising `(mean_tpr + 1 - fpr) / 2`, then
@@ -320,10 +342,17 @@ averaging each fold's own `argmax` — `argmax` is non-linear.
 
 **`per_fold_youden`** keeps whatever threshold each fold tuned during its own training.
 
-Common and averaging strategies need validation predictions in each fold's
-`best_model.pth`. New checkpoints also store ordered sample indices, and common
-selection verifies that they tile the development pool without touching test data.
-Older checkpoints remain evaluable through explicit legacy strategies.
+Common and averaging strategies use the same `y_true`/`y_prob` bundle in each fold's
+`best_model.pth`; only the aggregation changes. New checkpoints also store ordered sample
+indices for exact provenance checks. Older bundles without indices remain usable after
+checking their lengths, ordered labels, and recorded CV partitions. A checkpoint with no
+saved validation predictions cannot supply a threshold without rerunning validation
+inference.
+
+With `--threshold-from`, the threshold policy comes from the refit/evaluation config, not
+from the donor's historical training metadata. This lets the same saved probabilities be
+analysed with `cv_common_threshold` even when the older donor recorded
+`vertical_average`.
 
 Override per invocation with `--threshold-strategy` and `--fpr-rounding`, or bypass
 selection entirely with `--threshold`.
