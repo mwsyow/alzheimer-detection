@@ -38,3 +38,5 @@ configs/*
 condor/*
 !condor/README.md
 !condor/sync_to_hpc.sh
+
+reports/

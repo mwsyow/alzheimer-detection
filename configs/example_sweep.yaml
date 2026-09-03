@@ -21,12 +21,11 @@ metric:
   # wandb store them as a nested {"max": ...} dict that metric.name cannot read.
   # The "Best ..." keys are written as flat scalars precisely for this.
   #
-  # The name must match checkpoint.monitor in the JSON config:
-  #   val_auc               -> Best Validation AUC                (goal: maximize)
-  #   val_balanced_accuracy -> Best Validation Balanced Accuracy  (goal: maximize)
-  #   val_f1                -> Best Validation F1                 (goal: maximize)
-  #   val_accuracy          -> Best Validation Accuracy           (goal: maximize)
-  #   val_loss              -> Best Validation Loss               (goal: minimize)
+  # The name must match checkpoint.monitor in the JSON config. Training computes only
+  # threshold-free metrics, so these are the whole set:
+  #   val_auc / val_roc_auc     -> Best Validation AUC                (goal: maximize)
+  #   val_average_precision     -> Best Validation Average Precision  (goal: maximize)
+  #   val_loss                  -> Best Validation Loss               (goal: minimize)
   #
   # Under cross-validation this is the MEAN across folds, written by the parent run.
   name: Best Validation AUC

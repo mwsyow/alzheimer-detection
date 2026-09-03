@@ -7,8 +7,11 @@ every supported key present, so anything not listed below is not read by the cod
 uv run python train.py --config configs/my_config.json
 ```
 
-`configs/` is gitignored apart from `example.json`, `example_sweep.yaml` and this file,
-so your own configs stay local.
+`configs/` is gitignored apart from `example.json`, `example_sweep.yaml`, this file and
+the `bench_*.json` / `bench_*_sweep.yaml` benchmark arms, so your own configs stay local.
+The benchmark configs are tracked because they are the audit trail for the architecture
+comparison — they record the exact protocol every arm ran under, and `checkpoints/` is
+gitignored.
 
 ---
 
@@ -67,7 +70,7 @@ block each), `kernel_size`, `padding`, `pool_kernel_size`, `use_batch_norm`, `dr
 
 **`"name": "DenseNet121"`** — `num_classes` (or `out_channels`), `in_channels`,
 `spatial_dims`, `init_features`, `growth_rate`, `block_config`, `bn_size`, `act`,
-`norm`, `dropout_prob`. Any other key is silently dropped by the allow-list.
+`norm`, `dropout_prob`.
 
 **`"name": "ResNet10"`** — `num_classes` (or `out_channels`), `in_channels` (accepted as
 an alias for MONAI's `n_input_channels`), `spatial_dims`, `conv1_t_size`,
@@ -77,6 +80,10 @@ an alias for MONAI's `n_input_channels`), `spatial_dims`, `conv1_t_size`,
 **`"name": "EfficientNetB0"`** — `num_classes` (or `out_channels`), `in_channels`,
 `spatial_dims`, `norm`, `adv_prop`, and `model_name` if you want a different variant
 (`efficientnet-b0` … `b7`); the class name stays `EfficientNetB0` either way.
+
+`params` are forwarded to the constructor verbatim — there is no allow-list. A key the
+model does not accept is a `TypeError` at build time rather than a silent no-op that
+costs a full run to discover, so a misnamed sweep axis fails immediately.
 
 Parameter counts at `spatial_dims: 3`, 1 input channel, 2 classes: DenseNet121 11.2M,
 ResNet10 14.4M, EfficientNet-B3 12.1M. These are the ResNet and EfficientNet variants
@@ -276,7 +283,7 @@ then uses.
 | `save_best` / `save_last` | bool | |
 | `best_filename` | `"best_epoch_{epoch:03d}.pth"` | `{epoch}` is optional. CV always uses `best_model.pth`. |
 | `last_filename` | `"last.pth"` | |
-| `monitor` | `val_auc`, `val_roc_auc`, `val_balanced_accuracy`, `val_accuracy`, `val_f1`, `val_loss` | |
+| `monitor` | `val_auc`, `val_roc_auc`, `val_average_precision`, `val_loss` | Training computes only these; any other name raises at startup. |
 | `mode` | `"max"` or `"min"` | Must match the monitor — `min` for `val_loss`, `max` otherwise. |
 | `min_delta` | float | Improvement required to count. |
 

@@ -29,9 +29,9 @@ there. Source for the cluster facts below: `data/CS_HPC_Docu.pdf`.
 
 ## `sync_to_hpc.sh`
 
-`.gitignore` excludes `data/`, `.env`, `configs/*` (bar the examples), and
-`pretrained/`, so `git pull` on the cluster leaves the project unrunnable. This
-script fills those gaps.
+`.gitignore` excludes `data/`, `.env`, `configs/*` (bar the examples and the
+`bench_*` benchmark arms), and `pretrained/`, so `git pull` on the cluster leaves the
+project unrunnable. This script fills those gaps.
 
 `/home` is NFS-shared with every worker node, so a full sync only has to happen
 once — jobs read the files directly, with no `transfer_input_files`.
@@ -210,21 +210,28 @@ Whatever you put in `args` is forwarded to `evaluate.py` unchanged, so every fla
 it accepts works:
 
 ```bash
-# a whole CV run: each fold, mean +/- std, plus the ensemble
-condor_submit args="--checkpoint checkpoints/<run_id> --config configs/resnet10.json" \
-    condor/evaluate.sub
+# the headline number: a refit, thresholded from its CV sibling
+condor_submit args="--checkpoint checkpoints/<refit_run_id>/last.pth \
+    --threshold-from checkpoints/<cv_run_id> --log-wandb" condor/evaluate.sub
 
 # one checkpoint file
 condor_submit args="--checkpoint checkpoints/<run_id>/split_1/last.pth" condor/evaluate.sub
 
-# also push the numbers to the run's wandb page
-condor_submit args="--checkpoint checkpoints/<run_id> --log-wandb" condor/evaluate.sub
+# a whole CV run on test: each fold, mean +/- std, plus the ensemble. Diagnostic
+# only, hence the opt-in flag -- final reporting uses the refit above.
+condor_submit args="--checkpoint checkpoints/<run_id> --allow-cv-test-evaluation \
+    --config configs/resnet10.json" condor/evaluate.sub
 ```
 
-Point `--checkpoint` at a *run directory* to get the fold-by-fold report plus the
-ensemble; point it at a single `.pth` for one model. Results are written to
+Point `--checkpoint` at a single `.pth` for one model, or at a *run directory* — with
+`--allow-cv-test-evaluation` — for the fold-by-fold report plus the ensemble. Without
+that flag a run directory is refused, because evaluating every fold on test is a legacy
+diagnostic rather than the reported result. Results are written to
 `evaluations/<run_id>/` on NFS, so they outlive the job — read them from the
 submit node afterwards.
+
+For the benchmark arms, `submit_benchmark_refits.sh --evaluate` builds these invocations
+and pairs each refit with its threshold donor for you.
 
 `--config` only supplies evaluation-time settings (threshold, evaluation, device,
 wandb, dataloader). Everything describing the trained model comes from the run's
@@ -305,8 +312,9 @@ Things that bite:
 ### GPU memory
 
 `request_memory` is **host RAM** and has no effect on VRAM, so it is not the knob for
-a CUDA OOM. Every submit file now carries a `gpu_mem` macro that filters which GPUs
-may match:
+a CUDA OOM. Every submit file that runs the model — `train.sub`, `evaluate.sub` and
+`sweep_agent.sub` — carries a `gpu_mem` macro that filters which GPUs may match
+(`check_internet.sub` does not; it only probes connectivity):
 
 ```bash
 condor_submit gpu_mem=20000 args="--config configs/resnet10.json" condor/train.sub
