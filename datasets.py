@@ -10,6 +10,7 @@ from monai.transforms import (
     EnsureTyped,
     LoadImaged,
     NormalizeIntensityd,
+    Orientationd,
     RandAffined,
     RandBiasFieldd,
     RandFlipd,
@@ -19,6 +20,7 @@ from monai.transforms import (
     RandShiftIntensityd,
     Resized,
     ScaleIntensityd,
+    Spacingd,
 )
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import Subset
@@ -415,10 +417,17 @@ def build_cv_split_indices(dataset_items: list[dict], config: dict):
 # completion and every trial is identical, with nothing in the logs saying why.
 KNOWN_TRANSFORM_KEYS = frozenset(
     {
+        "spacing",
+        "pixdim",
+        "spacing_mode",
+        "orientation",
+        "axcodes",
         "resize",
         "spatial_size",
         "resize_mode",
         "scale_intensity",
+        "scale_channel_wise",
+        "intensity_order",
         "normalize_intensity",
         "normalize_nonzero",
         "normalize_channel_wise",
@@ -451,6 +460,8 @@ KNOWN_TRANSFORM_KEYS = frozenset(
     }
 )
 
+INTENSITY_ORDERS = frozenset({"scale_then_normalize", "normalize_then_scale"})
+
 
 def validate_transform_config(transform_config: dict) -> None:
     unknown = sorted(set(transform_config) - KNOWN_TRANSFORM_KEYS)
@@ -459,6 +470,17 @@ def validate_transform_config(transform_config: dict) -> None:
             f"Unknown transforms key(s): {', '.join(unknown)}. "
             f"Known keys: {', '.join(sorted(KNOWN_TRANSFORM_KEYS))}"
         )
+
+    intensity_order = transform_config.get("intensity_order", "scale_then_normalize")
+    if intensity_order not in INTENSITY_ORDERS:
+        raise ValueError(
+            "transforms.intensity_order must be one of "
+            f"{', '.join(sorted(INTENSITY_ORDERS))}, got {intensity_order!r}"
+        )
+    if transform_config.get("spacing", False) and "pixdim" not in transform_config:
+        raise ValueError("transforms.spacing=true requires transforms.pixdim")
+    if transform_config.get("orientation", False) and "axcodes" not in transform_config:
+        raise ValueError("transforms.orientation=true requires transforms.axcodes")
 
 
 def build_transforms(backend: DatasetBackend, config: dict, mode: str):
@@ -490,6 +512,22 @@ def build_transforms(backend: DatasetBackend, config: dict, mode: str):
     # after that is shared and config-driven.
     transforms = list(backend.load_transforms())
     transforms.append(EnsureChannelFirstd(keys=["image"], channel_dim="no_channel"))
+    if transform_config.get("spacing", False):
+        transforms.append(
+            Spacingd(
+                keys=["image"],
+                pixdim=tuple(transform_config["pixdim"]),
+                mode=transform_config.get("spacing_mode", "bilinear"),
+            )
+        )
+    if transform_config.get("orientation", False):
+        transforms.append(
+            Orientationd(
+                keys=["image"],
+                axcodes=transform_config["axcodes"],
+                labels=(("L", "R"), ("P", "A"), ("I", "S")),
+            )
+        )
     if transform_config.get("resize", False):
         transforms.append(
             Resized(
@@ -550,16 +588,32 @@ def build_transforms(backend: DatasetBackend, config: dict, mode: str):
             )
         )
 
-    if transform_config.get("scale_intensity", False):
-        transforms.append(ScaleIntensityd(keys=["image"]))
-    if transform_config.get("normalize_intensity", False):
-        transforms.append(
-            NormalizeIntensityd(
-                keys=["image"],
-                nonzero=transform_config.get("normalize_nonzero", True),
-                channel_wise=transform_config.get("normalize_channel_wise", True),
+    def append_scale_intensity():
+        if transform_config.get("scale_intensity", False):
+            transforms.append(
+                ScaleIntensityd(
+                    keys=["image"],
+                    channel_wise=transform_config.get("scale_channel_wise", False),
+                )
             )
-        )
+
+    def append_normalize_intensity():
+        if transform_config.get("normalize_intensity", False):
+            transforms.append(
+                NormalizeIntensityd(
+                    keys=["image"],
+                    nonzero=transform_config.get("normalize_nonzero", True),
+                    channel_wise=transform_config.get("normalize_channel_wise", True),
+                )
+            )
+
+    intensity_order = transform_config.get("intensity_order", "scale_then_normalize")
+    if intensity_order == "scale_then_normalize":
+        append_scale_intensity()
+        append_normalize_intensity()
+    else:
+        append_normalize_intensity()
+        append_scale_intensity()
 
     # --- intensity augmentation, after normalisation --------------------------
     if enabled("rand_gaussian_noise"):

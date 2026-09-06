@@ -10,8 +10,10 @@ configs is asserted rather than assumed.
 """
 
 import numpy as np
+import nibabel as nib
 import pytest
 import torch
+from monai.data import MetaTensor
 from monai.transforms import NormalizeIntensityd, RandRotate90d
 
 from datasets import (
@@ -55,8 +57,33 @@ def test_unknown_key_names_the_known_ones():
         validate_transform_config({**BASE, "totally_made_up": 1})
 
 
+def test_invalid_intensity_order_raises():
+    with pytest.raises(ValueError, match="intensity_order"):
+        validate_transform_config({**BASE, "intensity_order": "normalize_twice"})
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        ({"spacing": True}, "pixdim"),
+        ({"orientation": True}, "axcodes"),
+    ],
+)
+def test_enabled_spatial_metadata_transform_requires_its_setting(config, message):
+    with pytest.raises(ValueError, match=message):
+        validate_transform_config({**BASE, **config})
+
+
 def test_every_documented_key_is_accepted():
-    validate_transform_config({key: False for key in KNOWN_TRANSFORM_KEYS})
+    config = {key: False for key in KNOWN_TRANSFORM_KEYS}
+    config.update(
+        {
+            "pixdim": [1.0, 1.0, 1.0],
+            "axcodes": "SAR",
+            "intensity_order": "scale_then_normalize",
+        }
+    )
+    validate_transform_config(config)
 
 
 TOGGLES = (
@@ -85,6 +112,99 @@ def test_spatial_augmentation_precedes_normalisation():
     order = names({**BASE, "rand_flip": True, "rand_affine": True})
     assert order.index("RandFlipd") < order.index("NormalizeIntensityd")
     assert order.index("RandAffined") < order.index("NormalizeIntensityd")
+
+
+def test_spacing_orientation_and_resize_precede_intensity_transforms():
+    order = names(
+        {
+            **BASE,
+            "spacing": True,
+            "pixdim": [1.0, 1.0, 1.0],
+            "orientation": True,
+            "axcodes": "SAR",
+            "resize": True,
+            "spatial_size": [32, 256, 256],
+            "scale_intensity": True,
+            "intensity_order": "normalize_then_scale",
+        },
+        mode="val",
+    )
+    assert order[:6] == [
+        "EnsureChannelFirstd",
+        "Spacingd",
+        "Orientationd",
+        "Resized",
+        "NormalizeIntensityd",
+        "ScaleIntensityd",
+    ]
+
+
+def test_las_volume_is_reoriented_to_sar_using_its_affine():
+    volume = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+    las_affine = torch.tensor(
+        [
+            [-1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    transform = build_transforms(
+        InMemoryBackend({}),
+        {
+            "transforms": {
+                "resize": False,
+                "normalize_intensity": False,
+                "orientation": True,
+                "axcodes": "SAR",
+            }
+        },
+        "val",
+    )
+
+    result = transform({"image": MetaTensor(volume, affine=las_affine), "label": 0})[
+        "image"
+    ]
+
+    assert result.shape == (1, 4, 3, 2)
+    assert nib.aff2axcodes(result.affine.numpy()) == ("S", "A", "R")
+    expected = volume.permute(2, 1, 0).flip(2).unsqueeze(0)
+    torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.parametrize(
+    ("intensity_order", "expected"),
+    [
+        ("scale_then_normalize", ["ScaleIntensityd", "NormalizeIntensityd"]),
+        ("normalize_then_scale", ["NormalizeIntensityd", "ScaleIntensityd"]),
+    ],
+)
+def test_intensity_order_is_configurable(intensity_order, expected):
+    order = names(
+        {
+            **BASE,
+            "scale_intensity": True,
+            "intensity_order": intensity_order,
+        }
+    )
+    intensity = [name for name in order if name in expected]
+    assert intensity == expected
+
+
+def test_scale_channel_wise_reaches_monai_transform():
+    compose = build_transforms(
+        InMemoryBackend({}),
+        {
+            "transforms": {
+                **BASE,
+                "scale_intensity": True,
+                "scale_channel_wise": True,
+            }
+        },
+        "val",
+    )
+    scale = next(t for t in compose.transforms if type(t).__name__ == "ScaleIntensityd")
+    assert scale.scaler.channel_wise is True
 
 
 def test_bias_field_before_normalisation_noise_after():

@@ -39,6 +39,15 @@
     }
   },
   "transforms": {
+    "spacing": false,
+    "pixdim": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "spacing_mode": "bilinear",
+    "orientation": false,
+    "axcodes": "RAS",
     "resize": true,
     "spatial_size": [
       96,
@@ -47,9 +56,11 @@
     ],
     "resize_mode": "trilinear",
     "scale_intensity": false,
+    "scale_channel_wise": false,
     "normalize_intensity": true,
     "normalize_nonzero": true,
     "normalize_channel_wise": true,
+    "intensity_order": "scale_then_normalize",
     "rand_rotate90": false,
     "rand_rotate90_prob": 0.5,
     "rand_rotate90_spatial_axes": [

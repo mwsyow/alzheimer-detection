@@ -160,6 +160,25 @@ Other MONAI models retain the local-checkpoint form using
 `pretrained_weights_path`. Their compatible tensors are shape-filtered and a mismatched
 classifier is skipped. Pretraining options sit beside `params`, not inside it.
 
+BRAT DenseNet121 uses a source-specific, strict local loader:
+
+```json
+"pretrained": {
+  "enabled": true,
+  "source": "brat",
+  "pretrained_weights_path": "pretrained/BRAT/brat_t1c_densenet121.bin",
+  "freeze_backbone": false
+}
+```
+
+Download `brat_t1c_densenet121.bin` from the official
+[BRAT model zoo](https://github.com/maximek3/brat) before launching a job. The loader
+extracts `visual_encoder.densenet.*`, requires every DenseNet121 backbone tensor to
+match, discards the one-output source classifier and Q-Former, and initializes the
+project's two-output classifier. The checkpoint is intentionally not downloaded on a
+compute node: it is approximately 742 MB and is hosted on Google Drive. BRAT code and
+weights are CC BY-NC-SA 4.0 and therefore restricted to non-commercial use.
+
 ## `loss` / `optimizer`
 
 Only `CrossEntropyLoss` and `AdamW` are implemented; anything else raises.
@@ -174,10 +193,19 @@ Applied in this order; augmentation is train-split only.
 
 | key | notes |
 |---|---|
+| `spacing` / `pixdim` / `spacing_mode` | Resample using image-affine physical spacing before orientation and resize. `spacing: true` requires `pixdim`; default mode is `bilinear`. |
+| `orientation` / `axcodes` | Reorient from the image affine, for example `SAR`. This does not register an image to an atlas. `orientation: true` requires `axcodes`. |
 | `resize` / `spatial_size` / `resize_mode` | `false` keeps native resolution. |
-| `scale_intensity` | Min-max to [0, 1]. |
+| `scale_intensity` / `scale_channel_wise` | Min-max to [0, 1], globally by default or independently per channel. |
 | `normalize_intensity` / `normalize_nonzero` / `normalize_channel_wise` | Z-score. |
+| `intensity_order` | `scale_then_normalize` by default for backward compatibility; `normalize_then_scale` reproduces BRAT. |
 | `rand_rotate90` / `_prob` / `_spatial_axes` | **Train only.** Ill-advised on T88 volumes: they are atlas-registered, so a 90° rotation discards the voxel correspondence a small CNN needs, with no test-time equivalent. |
+
+The paired BRAT follow-up configs isolate the weight source from the preprocessing
+recipe. `brat_densenet121_current.json` retains the established `96x128x96` OASIS
+pipeline. `brat_densenet121_source_aligned.json` applies BRAT's published sequence:
+1 mm spacing, SAR orientation, `32x256x256`, nonzero channel-wise normalization, then
+channel-wise scaling to [0, 1]. Their sweep files run the same four paired CV seeds.
 
 ## `split`
 

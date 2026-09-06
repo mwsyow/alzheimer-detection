@@ -155,6 +155,75 @@ class DenseNet121(BaseDenseNet121, PretrainedMixin):
         ("features.denseblock4", "features.norm5"),
     )
 
+    def load_brat_weights(self, weights_path: str):
+        """Load the DenseNet121 vision backbone from an official BRAT checkpoint."""
+        checkpoint_path = Path(weights_path)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"BRAT checkpoint does not exist: {checkpoint_path}. Download "
+                "brat_t1c_densenet121.bin and set pretrained_weights_path."
+            )
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if isinstance(checkpoint, Mapping):
+            checkpoint = checkpoint.get(
+                "state_dict", checkpoint.get("model_state_dict", checkpoint)
+            )
+        if not isinstance(checkpoint, Mapping):
+            raise TypeError(
+                f"Expected a BRAT state dict in {checkpoint_path}, "
+                f"got {type(checkpoint)}"
+            )
+
+        prefix = "visual_encoder.densenet."
+        visual_state = {
+            key.removeprefix(prefix): value
+            for key, value in checkpoint.items()
+            if key.startswith(prefix)
+        }
+        if not visual_state:
+            raise RuntimeError(
+                f"BRAT checkpoint {checkpoint_path} contains no keys beneath "
+                f"{prefix!r}."
+            )
+
+        model_state = self.state_dict()
+        classifier_keys = {
+            f"{self.classifier_path}.weight",
+            f"{self.classifier_path}.bias",
+        }
+        expected_backbone = set(model_state) - classifier_keys
+        provided_backbone = set(visual_state) - classifier_keys
+        missing = sorted(expected_backbone - provided_backbone)
+        unexpected = sorted(provided_backbone - expected_backbone)
+        mismatched = sorted(
+            key
+            for key in expected_backbone & provided_backbone
+            if visual_state[key].shape != model_state[key].shape
+        )
+        if missing or unexpected or mismatched:
+            raise RuntimeError(
+                "BRAT DenseNet121 is incompatible with the constructed backbone: "
+                f"missing={missing}, unexpected={unexpected}, "
+                f"shape_mismatch={mismatched}."
+            )
+
+        backbone_state = {key: visual_state[key] for key in sorted(expected_backbone)}
+        incompatible = self.load_state_dict(backbone_state, strict=False)
+        if (
+            set(incompatible.missing_keys) != classifier_keys
+            or incompatible.unexpected_keys
+        ):
+            raise RuntimeError(
+                "BRAT load did not leave exactly the classifier uninitialized: "
+                f"missing={incompatible.missing_keys}, "
+                f"unexpected={incompatible.unexpected_keys}."
+            )
+        print(
+            f"BRAT DenseNet121 pretrained weights: {checkpoint_path} "
+            f"({len(backbone_state)} backbone tensors loaded)"
+        )
+
 
 class ResNet10(BaseResNet, PretrainedMixin):
     """MONAI ResNet-10 — the shallowest 3D ResNet, 14.4M parameters against
@@ -438,6 +507,7 @@ def build_model(config, initialize_pretrained: bool = True):
     pretrained = dict(model_config.get("pretrained", {}))
     pretrained_enabled = pretrained.get("enabled", pretrained.get("enable", False))
     pretrained_source = pretrained.get("source")
+    pretrained_weights_path = pretrained.get("pretrained_weights_path")
     freeze_backbone = pretrained.get("freeze_backbone", True)
     unfreeze_last_stages = pretrained.get("unfreeze_last_stages", 0)
 
@@ -466,6 +536,16 @@ def build_model(config, initialize_pretrained: bool = True):
             raise ValueError(
                 "MedicalNet is configured as a Hugging Face source; remove "
                 "pretrained_weights_path."
+            )
+    if pretrained_enabled and pretrained_source == "brat":
+        if model_name != "DenseNet121":
+            raise ValueError(
+                "pretrained.source='brat' is supported only by DenseNet121"
+            )
+        if not pretrained_weights_path:
+            raise ValueError(
+                "BRAT uses a manually downloaded checkpoint; set "
+                "model.pretrained.pretrained_weights_path."
             )
 
     # Params are passed straight to the constructor -- no allow-list. A key the
@@ -526,9 +606,10 @@ def build_model(config, initialize_pretrained: bool = True):
         and pretrained_enabled
         and isinstance(model, PretrainedMixin)
     ):
-        pretrained_weights_path = pretrained.get("pretrained_weights_path")
         if pretrained_source == "medicalnet":
             model.load_medicalnet_weights()
+        elif pretrained_source == "brat":
+            model.load_brat_weights(pretrained_weights_path)
         elif pretrained_weights_path:
             model.load_pretrained_weights(pretrained_weights_path)
         else:

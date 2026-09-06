@@ -56,6 +56,25 @@ not medical MRI.
   dependency and `HF_HOME` is placed in Condor job-local scratch to avoid shared-NFS
   cache races. The repository is public and needs no `HF_TOKEN`.
 
+## Verified BRAT DenseNet121 integration
+
+- Official source: `maximek3/brat`, checkpoint `brat_t1c_densenet121.bin` from the
+  repository's model zoo.
+- BRAT's vision encoder is MONAI's three-dimensional, one-channel DenseNet121. The
+  project extracts only `visual_encoder.densenet.*`; all Q-Former weights and the
+  source classifier are ignored, while every backbone tensor is required to match.
+- The checkpoint is supplied manually through `pretrained_weights_path` because the
+  approximately 742 MB release is hosted on Google Drive. Place it at
+  `pretrained/BRAT/brat_t1c_densenet121.bin` for the tracked example configs.
+- `configs/brat_densenet121_current.json` isolates BRAT initialization under the
+  existing pipeline. `configs/brat_densenet121_source_aligned.json` additionally uses
+  the published 1 mm, SAR, 32x256x256, normalize-then-scale preprocessing.
+- BRAT is trained on T1 post-contrast clinical MRI, whereas this project uses ordinary
+  T1 structural MRI. Its paper nevertheless reports transfer to binary Alzheimer
+  classification on ADNI.
+- BRAT code and model weights use CC BY-NC-SA 4.0: academic evaluation is permitted,
+  commercial use is not.
+
 ## Sources
 
 - MedicalNet: https://github.com/Tencent/MedicalNet
@@ -64,3 +83,4 @@ not medical MRI.
 - AnatCL: https://github.com/EIDOSLAB/AnatCL
 - SwinBrain: https://github.com/MAI-Lab-West-China-Hospital/SwinBrain
 - 3DINO: https://github.com/AICONSlab/3DINO
+- BRAT: https://github.com/maximek3/brat
