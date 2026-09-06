@@ -1,0 +1,40 @@
+# Stage-1 screen: how much of the MedicalNet ResNet10 backbone should be unfrozen?
+#
+# Hold the benchmark recipe and CV seed fixed so this screen isolates unfreezing depth.
+# After it completes, take the two highest depths by parent Best Validation AUC, union
+# them with endpoints 0 and 5, and rerun the deduplicated depths at seeds
+# [42, 1337, 7, 2024].
+#
+#   0: classifier only
+#   1: layer4 + classifier
+#   2: layer3-layer4 + classifier
+#   3: layer2-layer4 + classifier
+#   4: layer1-layer4 + classifier
+#   5: stem + layer1-layer4 + classifier (all parameters)
+
+program: train.py
+entity: wmarcellius123
+project: alzheimer-detection
+method: grid
+
+metric:
+  name: Best Validation AUC
+  goal: maximize
+
+parameters:
+  model.pretrained.freeze_backbone:
+    value: true
+  model.pretrained.unfreeze_last_stages:
+    values: [0, 1, 2, 3, 4, 5]
+  cv.random_seed:
+    value: 42
+
+command:
+  - ${env}
+  - uv
+  - run
+  - --no-dev
+  - python
+  - train.py
+  - --config
+  - configs/bench_resnet10_medicalnet.json

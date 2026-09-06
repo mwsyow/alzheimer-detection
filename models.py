@@ -62,9 +62,12 @@ def download_medicalnet_resnet10() -> Path:
 
 
 class PretrainedMixin(nn.Module):
-    # Dotted path to the final linear layer, the only module freeze_backbone leaves
-    # trainable. Each architecture names it differently.
+    # Dotted path to the final linear layer, which is always trainable when the
+    # backbone is frozen. Each architecture names it differently.
     classifier_path: str = ""
+    # Ordered from the input-side stem to the output-side stage. A stage may contain
+    # several module roots, for example a DenseNet block plus its transition.
+    backbone_stages: tuple[tuple[str, ...], ...] = ()
 
     def load_pretrained_weights(self, weights_path: str):
         state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
@@ -87,33 +90,70 @@ class PretrainedMixin(nn.Module):
         }
         self.load_state_dict(compatible_state_dict, strict=False)
 
-    def classifier(self) -> nn.Module:
+    def module_at_path(self, path: str) -> nn.Module:
         module: nn.Module = self
-        for attribute in self.classifier_path.split("."):
+        for attribute in path.split("."):
             module = getattr(module, attribute)
         return module
 
-    def freeze_backbone(self):
+    def classifier(self) -> nn.Module:
+        return self.module_at_path(self.classifier_path)
+
+    def validate_unfreeze_last_stages(self, unfreeze_last_stages: int):
+        stage_count = len(self.backbone_stages)
+        if not 0 <= unfreeze_last_stages <= stage_count:
+            raise ValueError(
+                f"unfreeze_last_stages must be between 0 and {stage_count} for "
+                f"{type(self).__name__}, got {unfreeze_last_stages}"
+            )
+
+    def freeze_backbone(self, unfreeze_last_stages: int = 0):
+        if isinstance(unfreeze_last_stages, bool) or not isinstance(
+            unfreeze_last_stages, int
+        ):
+            raise TypeError("unfreeze_last_stages must be an integer")
+        self.validate_unfreeze_last_stages(unfreeze_last_stages)
+
         self._backbone_frozen = True
         for param in self.parameters():
             param.requires_grad = False
-        for param in self.classifier().parameters():
-            param.requires_grad = True
+
+        selected_stages = (
+            self.backbone_stages[-unfreeze_last_stages:]
+            if unfreeze_last_stages
+            else ()
+        )
+        trainable_roots = [self.classifier()]
+        for stage in selected_stages:
+            trainable_roots.extend(self.module_at_path(path) for path in stage)
+        self._trainable_roots = tuple(trainable_roots)
+        for module in self._trainable_roots:
+            for param in module.parameters():
+                param.requires_grad = True
         self.train(self.training)
 
     def train(self, mode: bool = True):
         super().train(mode)
         if mode and getattr(self, "_backbone_frozen", False):
-            classifier = self.classifier()
+            # Set flags directly so freezing a parent container does not recurse into
+            # a selected child stage. Then recursively enable only the selected roots.
             for module in self.modules():
-                if module is not self and module is not classifier:
-                    module.eval()
-            classifier.train()
+                if module is not self:
+                    module.training = False
+            for module in self._trainable_roots:
+                module.train()
         return self
 
 
 class DenseNet121(BaseDenseNet121, PretrainedMixin):
     classifier_path = "class_layers.out"
+    backbone_stages = (
+        ("features.conv0", "features.norm0"),
+        ("features.denseblock1", "features.transition1"),
+        ("features.denseblock2", "features.transition2"),
+        ("features.denseblock3", "features.transition3"),
+        ("features.denseblock4", "features.norm5"),
+    )
 
 
 class ResNet10(BaseResNet, PretrainedMixin):
@@ -121,6 +161,13 @@ class ResNet10(BaseResNet, PretrainedMixin):
     DenseNet121's 11.2M. ResNet-18 is the next one up at 33.2M."""
 
     classifier_path = "fc"
+    backbone_stages = (
+        ("conv1", "bn1"),
+        ("layer1",),
+        ("layer2",),
+        ("layer3",),
+        ("layer4",),
+    )
 
     def __init__(
         self,
@@ -214,6 +261,16 @@ class EfficientNetBN(BaseEfficientNetBN, PretrainedMixin):
     """
 
     classifier_path = "_fc"
+    backbone_stages = (
+        ("_conv_stem", "_bn0"),
+        ("_blocks.0",),
+        ("_blocks.1",),
+        ("_blocks.2",),
+        ("_blocks.3",),
+        ("_blocks.4",),
+        ("_blocks.5",),
+        ("_blocks.6", "_conv_head", "_bn1", "_dropout"),
+    )
 
     def __init__(
         self,
@@ -254,6 +311,7 @@ class EfficientNet(BaseEfficientNet, PretrainedMixin):
     """
 
     classifier_path = "_fc"
+    backbone_stages = EfficientNetBN.backbone_stages
 
     def __init__(
         self,
@@ -380,6 +438,24 @@ def build_model(config, initialize_pretrained: bool = True):
     pretrained = dict(model_config.get("pretrained", {}))
     pretrained_enabled = pretrained.get("enabled", pretrained.get("enable", False))
     pretrained_source = pretrained.get("source")
+    freeze_backbone = pretrained.get("freeze_backbone", True)
+    unfreeze_last_stages = pretrained.get("unfreeze_last_stages", 0)
+
+    if isinstance(unfreeze_last_stages, bool) or not isinstance(
+        unfreeze_last_stages, int
+    ):
+        raise TypeError("model.pretrained.unfreeze_last_stages must be an integer")
+    if unfreeze_last_stages < 0:
+        raise ValueError("model.pretrained.unfreeze_last_stages cannot be negative")
+    if unfreeze_last_stages and not pretrained_enabled:
+        raise ValueError(
+            "model.pretrained.unfreeze_last_stages requires pretraining to be enabled"
+        )
+    if unfreeze_last_stages and not freeze_backbone:
+        raise ValueError(
+            "model.pretrained.unfreeze_last_stages conflicts with "
+            "freeze_backbone=false; use one or the other"
+        )
 
     if pretrained_enabled and pretrained_source == "medicalnet":
         if model_name != "ResNet10":
@@ -437,6 +513,14 @@ def build_model(config, initialize_pretrained: bool = True):
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
+    if unfreeze_last_stages and not isinstance(model, PretrainedMixin):
+        raise ValueError(
+            f"model.pretrained.unfreeze_last_stages is unsupported for {model_name}"
+        )
+    if pretrained_enabled and freeze_backbone and isinstance(model, PretrainedMixin):
+        # Validate before an invalid experiment can download a large checkpoint.
+        model.validate_unfreeze_last_stages(unfreeze_last_stages)
+
     if (
         initialize_pretrained
         and pretrained_enabled
@@ -459,7 +543,7 @@ def build_model(config, initialize_pretrained: bool = True):
     if (
         pretrained_enabled
         and isinstance(model, PretrainedMixin)
-        and pretrained.get("freeze_backbone", True)
+        and freeze_backbone
     ):
-        model.freeze_backbone()
+        model.freeze_backbone(unfreeze_last_stages)
     return model

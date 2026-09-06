@@ -126,6 +126,36 @@ applies the pretrained filters at a scale they were not trained on.
 including BatchNorm, in evaluation mode. `false` fine-tunes the whole network. Resume
 and evaluation reconstruct the architecture without downloading pretrained weights.
 
+For partial fine-tuning, keep `freeze_backbone: true` and set the number of tail
+stages to unfreeze:
+
+```json
+"pretrained": {
+  "enabled": true,
+  "source": "medicalnet",
+  "freeze_backbone": true,
+  "unfreeze_last_stages": 1
+}
+```
+
+`unfreeze_last_stages: 0` is the classifier-only default. A positive integer trains
+the classifier and the last N architecture stages with the same optimizer learning
+rate. Frozen stages and their BatchNorm layers stay in evaluation mode; selected stages,
+including their normalization and dropout modules, use training mode. Setting N to the
+architecture maximum makes every parameter trainable. A nonzero value conflicts with
+`freeze_backbone: false` and is rejected rather than silently ignored.
+
+| Model | Stages, input to output | Maximum |
+| --- | --- | ---: |
+| ResNet10 | stem; `layer1`; `layer2`; `layer3`; `layer4` | 5 |
+| DenseNet121 | stem; blocks 1-3 with their transitions; block 4 with final norm | 5 |
+| EfficientNet / EfficientNetBN | stem; MBConv groups 0-5; group 6 with head | 8 |
+
+The tracked `bench_*_partial_unfreeze_sweep.yaml` files screen depths 0-5 at CV seed
+42 without changing the original benchmark sweeps. For the follow-up, rank depths by
+the parent `Best Validation AUC`, take the best two, union them with endpoints 0 and 5,
+deduplicate, and run those depths at seeds `[42, 1337, 7, 2024]`.
+
 Other MONAI models retain the local-checkpoint form using
 `pretrained_weights_path`. Their compatible tensors are shape-filtered and a mismatched
 classifier is skipped. Pretraining options sit beside `params`, not inside it.
