@@ -28,6 +28,11 @@ parameters:
     values: [0, 1, 2, 3, 4, 5]
   cv.random_seed:
     value: 42
+  early_stopping.enabled:
+    value: true
+  early_stopping.patience:
+    value: 20
+  
 
 command:
   - ${env}
