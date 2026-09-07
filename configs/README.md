@@ -245,10 +245,10 @@ skips completed ones:
 uv run python train.py --config configs/my_config.json --resume checkpoints/<run_id>
 ```
 
-wandb gets one timestamped parent run (aggregate + sweep objective) plus one child per
+wandb gets one run-ID-named parent run (aggregate + sweep objective) plus one child per
 fold (per-epoch curves), sharing a group. A configured name such as `experiment` becomes
-`experiment-20260901-143052`; every child reuses it as
-`experiment-20260901-143052-fold1`, `...-fold2`, and so on.
+`experiment-a1b2c3d4`, where the suffix is the parent run ID; every child reuses it as
+`experiment-a1b2c3d4-fold1`, `...-fold2`, and so on.
 
 ## `refit`
 

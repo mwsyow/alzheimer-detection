@@ -2,9 +2,7 @@ import argparse
 import copy
 import json
 import math
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import torch
 from dotenv import load_dotenv
@@ -67,7 +65,6 @@ MONITOR_SUMMARY_KEYS = {
 # Cross-validation layout: checkpoints/<run_id>/split_<k>/best_model.pth
 FOLD_DIR_TEMPLATE = "split_{fold}"
 CV_BEST_FILENAME = "best_model.pth"
-WANDB_NAME_TIMEZONE = ZoneInfo("Europe/Berlin")
 # Deliberately not one of MONITOR_SUMMARY_KEYS: only the parent writes the sweep
 # objective, so fold runs can never win sweep.best_run().
 FOLD_SUMMARY_KEY = "Fold Best Validation Metric"
@@ -223,20 +220,9 @@ def get_checkpoint_dir(run: wandb.Run, config) -> Path:
     return checkpoint_dir
 
 
-def timestamp_wandb_name(base_name: str | None, now: datetime | None = None):
-    """Append one Europe/Berlin timestamp to a fresh parent run name.
-
-    Fold names derive from the resolved parent name. Resumed runs never call this
-    helper, so they keep the original parent and fold names.
-    """
-    if not base_name:
-        return None
-    current = now or datetime.now(WANDB_NAME_TIMEZONE)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=WANDB_NAME_TIMEZONE)
-    else:
-        current = current.astimezone(WANDB_NAME_TIMEZONE)
-    return f"{base_name}-{current.strftime('%Y%m%d-%H%M%S')}"
+def run_id_wandb_name(base_name: str | None, run_id: str) -> str:
+    """Build a readable name whose W&B-assigned run ID guarantees uniqueness."""
+    return f"{base_name}-{run_id}" if base_name else run_id
 
 
 def save_metadata(
@@ -975,11 +961,7 @@ def main():
     else:
         config = load_config(args.config)
 
-    resolved_name = None
-    if args.resume is None:
-        resolved_name = timestamp_wandb_name(config.get("wandb_name"))
-    elif metadata is not None:
-        resolved_name = metadata.get("wandb_run_name")
+    resolved_name = metadata.get("wandb_run_name") if metadata is not None else None
     if resolved_name is not None:
         wandb_init_kwargs["name"] = resolved_name
 
@@ -1000,6 +982,7 @@ def main():
         config = apply_sweep_overrides(config, wandb_run.config)
         config = normalize_threshold_config(config)
         wandb_run.config.update(config, allow_val_change=True)
+        wandb_run.name = run_id_wandb_name(config.get("wandb_name"), wandb_run.id)
 
     runner(
         run=wandb_run,

@@ -12,7 +12,6 @@ Second, that a refit run -- no validation split at all -- neither crashes nor si
 fabricates the quantities it cannot measure.
 """
 
-from datetime import datetime
 from types import SimpleNamespace
 
 
@@ -24,7 +23,7 @@ import pytest
 
 from conftest import FakeRun
 from metrics import unpack_predictions
-from train import start_fold_run, timestamp_wandb_name, train
+from train import run_id_wandb_name, start_fold_run, train
 
 EXPECTED_TRAIN_KEYS = {"Training Loss", "Training AUC", "Training Average Precision"}
 EXPECTED_VAL_KEYS = {
@@ -193,15 +192,14 @@ def test_a_refit_run_without_save_last_is_refused(tmp_path):
         )
 
 
-def test_wandb_name_gets_one_berlin_timestamp():
-    moment = datetime(2026, 9, 1, 14, 30, 52)
-    assert timestamp_wandb_name("bench-simple3dcnn", moment) == (
-        "bench-simple3dcnn-20260901-143052"
+def test_wandb_name_uses_the_unique_run_id():
+    assert run_id_wandb_name("bench-simple3dcnn", "a1b2c3d4") == (
+        "bench-simple3dcnn-a1b2c3d4"
     )
-    assert timestamp_wandb_name(None, moment) is None
+    assert run_id_wandb_name(None, "a1b2c3d4") == "a1b2c3d4"
 
 
-def test_every_cv_fold_reuses_the_timestamped_parent_name(monkeypatch):
+def test_every_cv_fold_reuses_the_run_id_named_parent(monkeypatch):
     calls = {}
     settings = SimpleNamespace(sweep_id="sweep123")
     monkeypatch.setattr("train.wandb.setup", lambda: SimpleNamespace(settings=settings))
@@ -212,7 +210,7 @@ def test_every_cv_fold_reuses_the_timestamped_parent_name(monkeypatch):
         return FakeRun(name=kwargs["name"], run_id=kwargs["id"])
 
     monkeypatch.setattr("train.wandb.init", fake_init)
-    parent = FakeRun(name="bench-simple3dcnn-20260901-143052")
+    parent = FakeRun(name="bench-simple3dcnn-parent001")
     child = start_fold_run(
         parent,
         {
@@ -225,7 +223,7 @@ def test_every_cv_fold_reuses_the_timestamped_parent_name(monkeypatch):
         fold_checkpoint=None,
     )
 
-    assert child.name == "bench-simple3dcnn-20260901-143052-fold3"
+    assert child.name == "bench-simple3dcnn-parent001-fold3"
     assert calls["name"] == child.name
     assert calls["group"] == "group001"
     assert settings.sweep_id == "sweep123"

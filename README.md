@@ -18,7 +18,7 @@ Documentation lives in three places: this file for the workflow end to end,
 The main entrypoint is `train.py`.
 
 1. Load the JSON config named by `--config` (required; start from `configs/example.json`).
-2. Initialize a W&B run, appending a timestamp to a configured `wandb_name`.
+2. Initialize a W&B run, appending its unique run ID to the configured `wandb_name`.
 3. Apply W&B sweep overrides, if the run is launched by a sweep.
 4. Load MRI paths and labels.
 5. Pick the split mode from the config — single train/validation/test split,
