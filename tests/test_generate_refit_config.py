@@ -34,6 +34,14 @@ def cv_metadata(best_epochs=(1, 20, 3, 3, 6), *, wandb_name="experiment"):
                 "name": "AdamW",
                 "params": {"lr": 0.0003, "weight_decay": 0.0123},
             },
+            "lr_scheduler": {
+                "enabled": True,
+                "name": "LinearWarmupCosineAnnealingLR",
+                "params": {
+                    "warmup_fraction": 0.1,
+                    "min_lr_ratio": 0.01,
+                },
+            },
             "loss": {
                 "name": "CrossEntropyLoss",
                 "params": {"label_smoothing": 0.1},
@@ -94,6 +102,7 @@ def test_generated_config_preserves_resolved_sweep_values_and_enables_refit():
         "dropout": 0.2,
     }
     assert generated["loss"]["params"]["label_smoothing"] == 0.1
+    assert generated["lr_scheduler"] == original["lr_scheduler"]
     assert generated["cv"]["enabled"] is False
     assert generated["refit"] == {"enabled": True}
     assert generated["early_stopping"]["enabled"] is False

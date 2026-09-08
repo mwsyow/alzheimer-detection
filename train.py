@@ -251,6 +251,7 @@ def save_checkpoint(
     best_monitor_value: float,
     early_stopping_counter: int,
     monitor_name: str,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     val_loss: float = None,
     monitor_value: float = None,
     fold: int = None,
@@ -261,6 +262,9 @@ def save_checkpoint(
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "lr_scheduler_state_dict": (
+                lr_scheduler.state_dict() if lr_scheduler is not None else None
+            ),
             # All three are None for a refit run, which has no validation split to
             # measure them on. Nothing is substituted: a fabricated value here would be
             # indistinguishable downstream from one that was actually measured.
@@ -325,6 +329,7 @@ def train(
     train_loader: DataLoader,
     val_loader: DataLoader,
     logger: wandb.Run,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
     checkpoint_dir: Path = None,
     best_monitor_value: float = None,
     early_stopping_counter: int = 0,
@@ -369,10 +374,15 @@ def train(
         model.train()
         train_logits = []
         train_labels = []
+        learning_rate = None
         for images, labels in train_loader:
+            # The scheduler advances after the optimizer update, so this is the rate
+            # actually applied to this batch rather than the one prepared for the next.
+            learning_rate = optim.param_groups[0]["lr"]
             _, outputs = train_step(
                 model=model,
                 optim=optim,
+                lr_scheduler=lr_scheduler,
                 loss=loss,
                 images=images,
                 labels=labels,
@@ -433,6 +443,7 @@ def train(
             "epoch": ep,
             "model": model,
             "optimizer": optim,
+            "lr_scheduler": lr_scheduler,
             "val_loss": val_loss,
             "best_monitor_value": best_monitor_value,
             "early_stopping_counter": early_stopping_counter,
@@ -475,7 +486,7 @@ def train(
             and early_stopping_config.get("enabled", False)
             and early_stopping_counter >= early_stopping_config.get("patience", 5)
         )
-        logs = {"Epoch": ep}
+        logs = {"Epoch": ep, "Learning Rate": learning_rate}
         logs.update(to_wandb_logs(train_metrics, "Training"))
         if has_validation:
             logs.update(to_wandb_logs(val_metrics, "Validation"))
@@ -521,6 +532,7 @@ def train_step(
     images: torch.Tensor,
     labels: torch.Tensor,
     device: torch.device = None,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
 ):
     model.train()
     if device is not None:
@@ -531,6 +543,8 @@ def train_step(
     train_loss = loss(output, labels)
     train_loss.backward()
     optim.step()
+    if lr_scheduler is not None:
+        lr_scheduler.step()
 
     return train_loss, output
 
@@ -552,6 +566,94 @@ def build_optimizer(config, model):
     if not trainable_parameters:
         raise ValueError("Model has no trainable parameters")
     return torch.optim.AdamW(trainable_parameters, **optimizer_config.get("params", {}))
+
+
+def build_lr_scheduler(config, optimizer, epochs: int, steps_per_epoch: int):
+    """Build the opt-in, optimizer-step-level warmup/cosine schedule.
+
+    LambdaLR applies lambda(0) while it is constructed. Treat that as the learning
+    rate for the first optimizer update, then advance the scheduler after each update.
+    This avoids spending the first batch at an exactly zero learning rate.
+    """
+    scheduler_config = config.get("lr_scheduler", {})
+    if not scheduler_config.get("enabled", False):
+        return None
+
+    name = scheduler_config.get("name")
+    if name != "LinearWarmupCosineAnnealingLR":
+        raise ValueError(
+            f"Unsupported lr_scheduler: {name!r}. Expected "
+            "'LinearWarmupCosineAnnealingLR'."
+        )
+
+    params = scheduler_config.get("params", {})
+    warmup_fraction = params.get("warmup_fraction", 0.1)
+    min_lr_ratio = params.get("min_lr_ratio", 0.01)
+    for key, value in (
+        ("warmup_fraction", warmup_fraction),
+        ("min_lr_ratio", min_lr_ratio),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+        ):
+            raise ValueError(f"lr_scheduler.params.{key} must be a finite number")
+    if not 0 <= warmup_fraction < 1:
+        raise ValueError(
+            "lr_scheduler.params.warmup_fraction must satisfy 0 <= value < 1"
+        )
+    if not 0 <= min_lr_ratio <= 1:
+        raise ValueError(
+            "lr_scheduler.params.min_lr_ratio must satisfy 0 <= value <= 1"
+        )
+    if not isinstance(epochs, int) or isinstance(epochs, bool) or epochs < 1:
+        raise ValueError("epochs must be a positive integer when lr_scheduler is enabled")
+    if (
+        not isinstance(steps_per_epoch, int)
+        or isinstance(steps_per_epoch, bool)
+        or steps_per_epoch < 1
+    ):
+        raise ValueError(
+            "steps_per_epoch must be a positive integer when lr_scheduler is enabled"
+        )
+
+    total_steps = epochs * steps_per_epoch
+    warmup_steps = math.ceil(total_steps * warmup_fraction)
+    if total_steps > 1:
+        warmup_steps = min(warmup_steps, total_steps - 1)
+    else:
+        warmup_steps = 0
+    decay_steps = total_steps - warmup_steps
+
+    def lr_factor(step: int) -> float:
+        # Clamping also makes the state harmless if train() is accidentally called for
+        # an extra step: cosine must not turn upward again beyond the planned budget.
+        step = min(max(step, 0), total_steps - 1)
+        if warmup_steps and step < warmup_steps:
+            return (step + 1) / warmup_steps
+        if decay_steps == 1:
+            return 1.0
+        progress = (step - warmup_steps) / (decay_steps - 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_factor)
+
+
+def restore_lr_scheduler(
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+    checkpoint: dict,
+) -> None:
+    if lr_scheduler is None:
+        return
+    state = checkpoint.get("lr_scheduler_state_dict")
+    if state is None:
+        raise ValueError(
+            "Cannot resume with lr_scheduler enabled: the checkpoint has no "
+            "lr_scheduler_state_dict"
+        )
+    lr_scheduler.load_state_dict(state)
 
 
 def resolve_device(config) -> torch.device:
@@ -747,6 +849,12 @@ def run_cross_validation(
             device
         )
         optim = build_optimizer(config, model)
+        lr_scheduler = build_lr_scheduler(
+            config,
+            optim,
+            epochs=config["epochs"],
+            steps_per_epoch=len(train_loader),
+        )
 
         epochs = config["epochs"]
         best_monitor_value = worst_monitor_value(mode)
@@ -755,6 +863,7 @@ def run_cross_validation(
         if fold_checkpoint is not None:
             model.load_state_dict(fold_checkpoint["model_state_dict"])
             optim.load_state_dict(fold_checkpoint["optimizer_state_dict"])
+            restore_lr_scheduler(lr_scheduler, fold_checkpoint)
             epochs = range(fold_checkpoint["epoch"] + 1, config["epochs"])
             best_monitor_value, early_stopping_counter = resume_monitor_state(
                 fold_checkpoint, monitor_name, mode
@@ -771,6 +880,7 @@ def run_cross_validation(
             epochs=epochs,
             model=model,
             optim=optim,
+            lr_scheduler=lr_scheduler,
             loss=loss,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -849,9 +959,16 @@ def runner(
     model = build_model(config, initialize_pretrained=not is_resume)
     model.to(device)
     optim = build_optimizer(config, model)
+    lr_scheduler = build_lr_scheduler(
+        config,
+        optim,
+        epochs=config["epochs"],
+        steps_per_epoch=len(train_loader),
+    )
     if is_resume:
         model.load_state_dict(resume_checkpoint["model_state_dict"])
         optim.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        restore_lr_scheduler(lr_scheduler, resume_checkpoint)
     epochs = config["epochs"]
     monitor_name = config["checkpoint"].get("monitor", "val_loss")
     mode = config["checkpoint"].get("mode", "min")
@@ -895,6 +1012,7 @@ def runner(
         epochs=epochs,
         model=model,
         optim=optim,
+        lr_scheduler=lr_scheduler,
         loss=loss,
         train_loader=train_loader,
         val_loader=val_loader,

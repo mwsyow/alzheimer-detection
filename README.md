@@ -59,6 +59,7 @@ uv run python train.py --config configs/example.json
 ```
 
 The config controls model params, optimizer params, transforms, dataloader settings,
+an optional batch-level warmup/cosine learning-rate schedule,
 splitting and cross-validation, checkpointing, early stopping, threshold selection, and
 W&B settings. See [`configs/README.md`](configs/README.md) for every key.
 

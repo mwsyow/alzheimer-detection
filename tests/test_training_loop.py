@@ -81,7 +81,9 @@ def run_epochs(
 def test_training_logs_exactly_the_threshold_free_metrics(tmp_path):
     _, logger = run_epochs(tmp_path)
     (logged,) = logger.log_calls
-    assert set(logged) == {"Epoch"} | EXPECTED_TRAIN_KEYS | EXPECTED_VAL_KEYS
+    assert set(logged) == (
+        {"Epoch", "Learning Rate"} | EXPECTED_TRAIN_KEYS | EXPECTED_VAL_KEYS
+    )
 
 
 def test_no_thresholded_metric_is_reported(tmp_path):
@@ -109,6 +111,7 @@ def test_no_threshold_reaches_a_checkpoint(tmp_path):
     run_epochs(tmp_path)
     checkpoint = torch.load(tmp_path / "last.pth", weights_only=False)
     assert "threshold" not in checkpoint
+    assert checkpoint["lr_scheduler_state_dict"] is None
 
 
 def test_a_checkpoint_carries_the_validation_predictions(tmp_path):
@@ -141,7 +144,7 @@ def test_a_refit_epoch_runs_and_writes_only_the_last_checkpoint(tmp_path):
 def test_a_refit_run_logs_no_validation_metrics(tmp_path):
     _, logger = run_epochs(tmp_path, with_validation=False)
     (logged,) = logger.log_calls
-    assert set(logged) == {"Epoch"} | EXPECTED_TRAIN_KEYS
+    assert set(logged) == {"Epoch", "Learning Rate"} | EXPECTED_TRAIN_KEYS
 
 
 def test_a_refit_run_writes_no_best_validation_summary_key(tmp_path):
