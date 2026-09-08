@@ -179,13 +179,33 @@ project's two-output classifier. The checkpoint is intentionally not downloaded 
 compute node: it is approximately 742 MB and is hosted on Google Drive. BRAT code and
 weights are CC BY-NC-SA 4.0 and therefore restricted to non-commercial use.
 
-## `loss` / `optimizer`
+## `loss` / `optimizer` / `lr_scheduler`
 
 Only `CrossEntropyLoss` and `AdamW` are implemented; anything else raises.
 
 `loss.params.weight` takes a per-class list for imbalance, e.g. `[1.0, 1.343]` for a
 94/70 training split. `optimizer.params` accepts `lr`, `weight_decay`, and the rest of
 the AdamW signature.
+
+`lr_scheduler` is optional. With no block, or with `enabled: false`, AdamW keeps its
+configured learning rate. The supported scheduled form is:
+
+```json
+"lr_scheduler": {
+  "enabled": true,
+  "name": "LinearWarmupCosineAnnealingLR",
+  "params": {
+    "warmup_fraction": 0.1,
+    "min_lr_ratio": 0.01
+  }
+}
+```
+
+It advances after every optimizer update. Warmup length is the configured fraction of
+all `epochs * batches_per_epoch` updates, rounded up; the first update is non-zero and
+the warmup ends at `optimizer.params.lr`. The remaining updates cosine-decay to that
+base rate times `min_lr_ratio`. Fractional values automatically adapt when refit config
+generation changes the epoch budget. Checkpoints preserve the schedule position.
 
 ## `transforms`
 
