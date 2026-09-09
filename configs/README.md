@@ -25,6 +25,13 @@ gitignored.
 | `wandb_project` | string | Consider a separate project for smoke tests. |
 | `wandb_mode` | `"online"`, `"offline"`, `"disabled"` | **Overrides the `WANDB_MODE` env var**, because it is passed to `wandb.init` explicitly. Set it here, not in the shell. |
 | `wandb_name` | string or `null` | `null` lets wandb generate a name. |
+| `seed` | int | Model initialization, shuffling, workers, and augmentation. Independent from `cv.random_seed`. |
+
+## `task`
+
+`{"name": "ad_classification"}` uses the two-logit AD head.
+`{"name": "age_regression"}` uses a scalar head and Huber loss on ages standardized
+from the training folds only. Missing `task` retains legacy AD classification.
 
 ## `dataset`
 
@@ -242,12 +249,24 @@ Cross-validation is enabled by **the presence of this block**; `"enabled": false
 switches it off without deleting it.
 
 ```json
-"cv": { "enabled": true, "n_splits": 5, "shuffle": true, "random_seed": 42 }
+"cv": {
+  "enabled": true,
+  "strategy": "rotating_test",
+  "n_splits": 5,
+  "shuffle": true,
+  "random_seed": 42
+}
 ```
 
-The test set is carved out once by `split`, then the pooled train+val is
-`StratifiedKFold`-ed, so test never varies across folds and stays comparable to
-single-split runs.
+With `rotating_test`, fold i is test, the next cyclic fold is validation, and the
+remaining K-2 folds are training. Every subject is test once and validation once.
+`cv.random_seed` controls the partition; top-level `seed` controls training
+randomness. Supply a reusable `subject_id,label,fold` CSV through
+`cv.manifest_path` when another architecture or tabular pipeline must consume the
+exact assignments.
+
+Configs without `strategy: rotating_test` retain the historical fixed-test behavior
+and should be launched with `train_legacy.py`.
 
 Layout, one directory per fold:
 

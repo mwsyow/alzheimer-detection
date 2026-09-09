@@ -2,11 +2,15 @@ import argparse
 import copy
 import json
 import math
+import random
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import torch
 from dotenv import load_dotenv
 from monai.data import DataLoader
+from monai.utils import set_determinism
 from torch import nn
 
 import wandb
@@ -14,6 +18,7 @@ from datasets import (
     build_cv_split_indices,
     build_dataset_source,
     build_refit_split_indices,
+    build_rotating_cv_split_indices,
     build_split_indices,
     resolve_split_mode,
 )
@@ -25,6 +30,7 @@ from metrics import (
     DEFAULT_THRESHOLD_OBJECTIVE,
     DEFAULT_THRESHOLD_TIE_BREAK,
     EPOCH_LOG_METRICS,
+    REGRESSION_EPOCH_LOG_METRICS,
     THRESHOLD_OBJECTIVES,
     THRESHOLD_TIE_BREAKS,
     WANDB_METRIC_LABELS,
@@ -32,10 +38,13 @@ from metrics import (
     collect_predictions,
     pack_predictions,
     ranking_metrics,
+    regression_metrics,
     summarize_predictions,
     to_wandb_logs,
 )
 from models import build_model
+from tasks import StandardizedHuberLoss, is_regression, task_name
+from artifacts import consolidate_manifests, export_fold_artifacts, file_sha256
 
 load_dotenv(override=True)
 
@@ -50,6 +59,7 @@ MONITOR_METRIC_KEYS = {
     "val_auc": "roc_auc",
     "val_roc_auc": "roc_auc",
     "val_average_precision": "average_precision",
+    "val_mae": "mae",
 }
 
 # define_metric(summary="max") stores a nested {"max": ...} dict rather than a scalar,
@@ -60,7 +70,20 @@ MONITOR_SUMMARY_KEYS = {
     "val_auc": "Best Validation AUC",
     "val_roc_auc": "Best Validation AUC",
     "val_average_precision": "Best Validation Average Precision",
+    "val_mae": "Best Validation MAE",
 }
+
+
+def seed_everything(seed: int) -> None:
+    """Seed model, loader, worker and augmentation RNGs for one fold."""
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise TypeError(f"seed must be an integer, got {seed!r}")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    set_determinism(seed=seed)
 
 # Cross-validation layout: checkpoints/<run_id>/split_<k>/best_model.pth
 FOLD_DIR_TEMPLATE = "split_{fold}"
@@ -189,6 +212,24 @@ def apply_sweep_overrides(config: dict, sweep_config) -> dict:
     return config
 
 
+def normalize_task_config(config: dict) -> dict:
+    """Resolve task-owned head/loss/monitor settings into saved run config."""
+    config = deep_update({}, config)
+    name = task_name(config)
+    if name == "age_regression":
+        loss_params = config.get("loss", {}).get("params", {})
+        delta = config.get("task", {}).get(
+            "huber_delta", loss_params.get("delta", loss_params.get("beta", 1.0))
+        )
+        config["loss"] = {"name": "HuberLoss", "params": {"delta": delta}}
+        config["checkpoint"] = {
+            **config["checkpoint"],
+            "monitor": "val_mae",
+            "mode": "min",
+        }
+    return config
+
+
 def find_metadata_path(checkpoint_path: Path) -> Path:
     """Locate metadata.pth for a checkpoint.
 
@@ -256,6 +297,7 @@ def save_checkpoint(
     monitor_value: float = None,
     fold: int = None,
     val_predictions: dict = None,
+    target_scaler: dict = None,
 ):
     torch.save(
         {
@@ -281,6 +323,7 @@ def save_checkpoint(
             # all: evaluate.py chooses one across the folds from exactly these arrays.
             # A checkpoint without them can only be evaluated at a pinned threshold.
             "val_predictions": val_predictions,
+            "target_scaler": target_scaler,
         },
         checkpoint_path,
     )
@@ -341,6 +384,7 @@ def train(
     summary_key: str = None,
     on_epoch_end=None,
     best_result: dict = None,
+    target_scaler: dict = None,
 ):
     if isinstance(epochs, int):
         epochs = range(epochs)
@@ -398,9 +442,21 @@ def train(
             labels=torch.cat(train_labels),
             loss_fn=loss,
         )
-        train_metrics = ranking_metrics(
-            train_results["y_true"], train_results["y_prob"], loss=train_results["loss"]
-        )
+        regression = getattr(loss, "task_name", None) == "age_regression"
+        if regression:
+            train_metrics = regression_metrics(
+                train_results["y_true"],
+                train_results["y_pred"],
+                loss=train_results["loss"],
+            )
+            epoch_metric_keys = REGRESSION_EPOCH_LOG_METRICS
+        else:
+            train_metrics = ranking_metrics(
+                train_results["y_true"],
+                train_results["y_prob"],
+                loss=train_results["loss"],
+            )
+            epoch_metric_keys = EPOCH_LOG_METRICS
         final_train_metrics = train_metrics
 
         val_metrics = None
@@ -414,8 +470,18 @@ def train(
                 loss_fn=loss,
                 device=device,
             )
-            val_metrics = ranking_metrics(
-                val_results["y_true"], val_results["y_prob"], loss=val_results["loss"]
+            val_metrics = (
+                regression_metrics(
+                    val_results["y_true"],
+                    val_results["y_pred"],
+                    loss=val_results["loss"],
+                )
+                if regression
+                else ranking_metrics(
+                    val_results["y_true"],
+                    val_results["y_prob"],
+                    loss=val_results["loss"],
+                )
             )
             val_loss = val_metrics["loss"]
             monitor_value = resolve_monitor_value(val_metrics, monitor_name)
@@ -451,14 +517,23 @@ def train(
             "monitor_value": monitor_value,
             "fold": fold,
             "val_predictions": (
-                pack_predictions(
-                    val_results["y_true"],
-                    val_results["y_prob"],
-                    indices=val_indices,
+                (
+                    {
+                        "y_true": torch.as_tensor(val_results["y_true"]).float(),
+                        "y_pred": torch.as_tensor(val_results["y_pred"]).float(),
+                        "indices": torch.as_tensor(val_indices).long(),
+                    }
+                    if regression
+                    else pack_predictions(
+                        val_results["y_true"],
+                        val_results["y_prob"],
+                        indices=val_indices,
+                    )
                 )
                 if has_validation
                 else None
             ),
+            "target_scaler": target_scaler,
         }
 
         if (
@@ -487,9 +562,9 @@ def train(
             and early_stopping_counter >= early_stopping_config.get("patience", 5)
         )
         logs = {"Epoch": ep, "Learning Rate": learning_rate}
-        logs.update(to_wandb_logs(train_metrics, "Training"))
+        logs.update(to_wandb_logs(train_metrics, "Training", keys=epoch_metric_keys))
         if has_validation:
-            logs.update(to_wandb_logs(val_metrics, "Validation"))
+            logs.update(to_wandb_logs(val_metrics, "Validation", keys=epoch_metric_keys))
         logger.log(logs)
 
         # Persist resume state only after the epoch's checkpoints are on disk, so
@@ -549,7 +624,15 @@ def train_step(
     return train_loss, output
 
 
-def build_loss(config):
+def build_loss(config, target_scaler: dict = None):
+    if is_regression(config):
+        if target_scaler is None:
+            raise ValueError("age_regression requires a train-fold target scaler")
+        params = config.get("loss", {}).get("params", {})
+        delta = params.get("delta", params.get("beta", 1.0))
+        return StandardizedHuberLoss(
+            mean=target_scaler["mean"], std=target_scaler["std"], delta=delta
+        )
     loss_config = config["loss"]
     if loss_config["name"] != "CrossEntropyLoss":
         raise ValueError(f"Unsupported loss: {loss_config['name']}")
@@ -661,7 +744,10 @@ def resolve_device(config) -> torch.device:
     if requested_device == "auto":
         requested_device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(requested_device)
-    config.update({"device": str(device)}, allow_val_change=True)
+    try:
+        config.update({"device": str(device)}, allow_val_change=True)
+    except TypeError:
+        config.update({"device": str(device)})
     return device
 
 
@@ -730,7 +816,7 @@ def log_fold_summary(parent: wandb.Run, fold_number: int, result: dict):
             "Fold": fold_number,
             **{
                 f"Fold {WANDB_METRIC_LABELS[key]}": metrics[key]
-                for key in EPOCH_LOG_METRICS
+                for key in WANDB_METRIC_LABELS
                 if metrics.get(key) is not None
             },
             "Fold Best Epoch": best.get("epoch"),
@@ -781,6 +867,190 @@ def save_cv_metadata(checkpoint_dir: Path, run: wandb.Run, config, cv_state: dic
         },
         checkpoint_dir / "metadata.pth",
     )
+
+
+def age_scaler_for_indices(source, indices: list[int]) -> dict:
+    ages = np.asarray([source.items[index]["age"] for index in indices], dtype=float)
+    std = float(ages.std())
+    if not np.isfinite(std) or std <= 0:
+        raise ValueError("Training ages must have positive finite standard deviation")
+    return {"mean": float(ages.mean()), "std": std}
+
+
+def run_rotating_cross_validation(
+    run: wandb.Run,
+    config,
+    metadata: dict | None = None,
+    is_resume: bool = False,
+):
+    """K rotations where every subject is test once and validation once."""
+    device = resolve_device(config)
+    source = build_dataset_source(config)
+    checkpoint_dir = get_checkpoint_dir(run, config)
+    checkpoint_config = dict(config["checkpoint"])
+    checkpoint_config["best_filename"] = CV_BEST_FILENAME
+    if is_regression(config):
+        checkpoint_config.update({"monitor": "val_mae", "mode": "min"})
+    monitor_name = checkpoint_config.get("monitor", "val_loss")
+    mode = checkpoint_config.get("mode", "min")
+
+    if is_resume:
+        cv_state = metadata["cv"]
+        if cv_state.get("strategy") != "rotating_test":
+            raise ValueError("The resume directory is not a rotating-test CV run")
+    else:
+        splits = build_rotating_cv_split_indices(source.items, config)
+        fold_manifest_path = checkpoint_dir / "fold_manifest.csv"
+        subject_labels = {}
+        for item in source.items:
+            subject_labels[str(item.get("subject_id", item["image_id"]))] = int(
+                item["label"]
+            )
+        pd.DataFrame(
+            [
+                {
+                    "subject_id": subject_id,
+                    "label": subject_labels[subject_id],
+                    "fold": fold,
+                    "n_splits": config["cv"]["n_splits"],
+                    "cv_random_seed": config["cv"].get("random_seed"),
+                }
+                for subject_id, fold in sorted(splits["subject_folds"].items())
+            ]
+        ).to_csv(fold_manifest_path, index=False)
+        cv_state = {
+            **splits,
+            "fold_manifest": str(fold_manifest_path),
+            "fold_manifest_sha256": file_sha256(fold_manifest_path),
+            "group_id": wandb.util.generate_id(),
+            "fold_run_ids": {},
+            "completed_folds": [],
+            "current_fold": 1,
+            "current_epoch": None,
+            "fold_results": {},
+            "target_scalers": {},
+        }
+        save_cv_metadata(checkpoint_dir, run, config, cv_state)
+
+    run.summary["CV Folds"] = len(cv_state["folds"])
+    run.summary["CV Strategy"] = "rotating_test"
+    run.summary["Training Seed"] = int(config.get("seed", 0))
+    run.summary["CV Random Seed"] = config["cv"].get("random_seed")
+    run.define_metric("Fold*", summary="none")
+
+    artifact_root = Path(config.get("artifacts", {}).get("dir", checkpoint_dir / "artifacts"))
+    if artifact_root != checkpoint_dir / "artifacts":
+        artifact_root = artifact_root / run.id
+
+    for fold_number, fold in enumerate(cv_state["folds"], start=1):
+        if fold_number in cv_state["completed_folds"]:
+            continue
+
+        seed_everything(int(config.get("seed", 0)))
+        current_dir = fold_dir(checkpoint_dir, fold_number)
+        current_dir.mkdir(parents=True, exist_ok=True)
+        fold_checkpoint = None
+        resuming_fold = is_resume and fold_number == cv_state["current_fold"]
+        if resuming_fold:
+            last_path = current_dir / checkpoint_config.get("last_filename", "last.pth")
+            if last_path.exists():
+                fold_checkpoint = torch.load(last_path, map_location="cpu")
+
+        child = start_fold_run(run, config, cv_state, fold_number, fold_checkpoint)
+        cv_state["fold_run_ids"][fold_number] = child.id
+        cv_state["current_fold"] = fold_number
+        train_loader, val_loader = source.fold_loaders(fold)
+        source.set_random_state(int(config.get("seed", 0)))
+
+        target_scaler = (
+            age_scaler_for_indices(source, fold["train_idx"])
+            if is_regression(config)
+            else None
+        )
+        if target_scaler is not None:
+            cv_state["target_scalers"][fold_number] = target_scaler
+        loss = build_loss(config, target_scaler=target_scaler)
+        model = build_model(config, initialize_pretrained=fold_checkpoint is None).to(device)
+        optim = build_optimizer(config, model)
+        lr_scheduler = build_lr_scheduler(
+            config, optim, epochs=config["epochs"], steps_per_epoch=len(train_loader)
+        )
+
+        epochs = config["epochs"]
+        best_monitor_value = worst_monitor_value(mode)
+        early_stopping_counter = 0
+        best_result = None
+        if fold_checkpoint is not None:
+            model.load_state_dict(fold_checkpoint["model_state_dict"])
+            optim.load_state_dict(fold_checkpoint["optimizer_state_dict"])
+            restore_lr_scheduler(lr_scheduler, fold_checkpoint)
+            epochs = range(fold_checkpoint["epoch"] + 1, config["epochs"])
+            best_monitor_value, early_stopping_counter = resume_monitor_state(
+                fold_checkpoint, monitor_name, mode
+            )
+            best_result = cv_state.get("fold_results", {}).get(fold_number)
+
+        def on_epoch_end(epoch, fold, best_result, **_):
+            cv_state["current_epoch"] = epoch
+            if best_result is not None:
+                cv_state["fold_results"][fold] = best_result
+            save_cv_metadata(checkpoint_dir, run, config, cv_state)
+
+        result = train(
+            epochs=epochs,
+            model=model,
+            optim=optim,
+            lr_scheduler=lr_scheduler,
+            loss=loss,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            logger=child,
+            checkpoint_dir=current_dir,
+            best_monitor_value=best_monitor_value,
+            early_stopping_counter=early_stopping_counter,
+            checkpoint_config=checkpoint_config,
+            early_stopping_config=config["early_stopping"],
+            device=device,
+            fold=fold_number,
+            val_indices=fold["val_idx"],
+            summary_key=FOLD_SUMMARY_KEY,
+            on_epoch_end=on_epoch_end,
+            best_result=best_result,
+            target_scaler=target_scaler,
+        )
+        if result["best_result"] is None:
+            raise RuntimeError(f"Fold {fold_number} produced no best checkpoint")
+        cv_state["fold_results"][fold_number] = result["best_result"]
+
+        best_path = current_dir / CV_BEST_FILENAME
+        best_checkpoint = torch.load(best_path, map_location="cpu")
+        model.load_state_dict(best_checkpoint["model_state_dict"])
+        export_fold_artifacts(
+            model=model,
+            source=source,
+            split_indices=fold,
+            checkpoint_path=best_path,
+            checkpoint=best_checkpoint,
+            config=config,
+            fold=fold_number,
+            device=device,
+            loss_fn=loss,
+            output_root=artifact_root,
+        )
+
+        cv_state["completed_folds"] = sorted(
+            set(cv_state["completed_folds"]) | {fold_number}
+        )
+        cv_state["current_epoch"] = None
+        cv_state["artifact_root"] = str(artifact_root)
+        save_cv_metadata(checkpoint_dir, run, config, cv_state)
+        log_fold_summary(run, fold_number, result)
+        child.finish()
+
+    cv_state["artifact_manifest"] = str(consolidate_manifests(artifact_root))
+    save_cv_metadata(checkpoint_dir, run, config, cv_state)
+    log_cv_aggregate(run, cv_state, monitor_name)
+    return cv_state
 
 
 def run_cross_validation(
@@ -921,6 +1191,14 @@ def runner(
     resume_checkpoint: dict | None = None,
     metadata: dict | None = None,
 ):
+    if (
+        config.get("cv", {}).get("enabled", bool(config.get("cv")))
+        and config.get("cv", {}).get("strategy") == "rotating_test"
+    ):
+        return run_rotating_cross_validation(
+            run=run, config=config, metadata=metadata, is_resume=metadata is not None
+        )
+
     split_mode = resolve_split_mode(config)
     if split_mode == "cv":
         return run_cross_validation(
@@ -928,6 +1206,8 @@ def runner(
         )
 
     is_resume = resume_checkpoint is not None
+    if "seed" in config:
+        seed_everything(int(config["seed"]))
     device = resolve_device(config)
 
     source = build_dataset_source(config)
@@ -1038,7 +1318,7 @@ def runner(
     return result
 
 
-def main():
+def main(legacy_only: bool = False):
     parser = argparse.ArgumentParser(description="Train a 3D CNN on OASIS MRI data.")
     parser.add_argument(
         "--config",
@@ -1069,15 +1349,17 @@ def main():
         else:
             resume_checkpoint = torch.load(args.resume, map_location="cpu")
             metadata = load_metadata(find_metadata_path(args.resume))
-        config = normalize_threshold_config(
-            metadata["config"], legacy_missing_strategy=True
+        config = normalize_task_config(
+            normalize_threshold_config(
+                metadata["config"], legacy_missing_strategy=True
+            )
         )
         wandb_init_kwargs = {
             "id": metadata["run_id"],
             "resume": "must",
         }
     else:
-        config = load_config(args.config)
+        config = normalize_task_config(load_config(args.config))
 
     resolved_name = metadata.get("wandb_run_name") if metadata is not None else None
     if resolved_name is not None:
@@ -1095,12 +1377,19 @@ def main():
     wandb_run.define_metric("Validation AUC", summary="max")
     wandb_run.define_metric("Validation Average Precision", summary="max")
     wandb_run.define_metric("Validation Loss", summary="min")
+    wandb_run.define_metric("Validation MAE", summary="min")
 
     if args.resume is None:
         config = apply_sweep_overrides(config, wandb_run.config)
         config = normalize_threshold_config(config)
+        config = normalize_task_config(config)
         wandb_run.config.update(config, allow_val_change=True)
         wandb_run.name = run_id_wandb_name(config.get("wandb_name"), wandb_run.id)
+
+    if legacy_only and config.get("cv", {}).get("strategy") == "rotating_test":
+        raise ValueError("train_legacy.py cannot run cv.strategy='rotating_test'")
+    if is_regression(config) and config.get("cv", {}).get("strategy") != "rotating_test":
+        raise ValueError("age_regression is supported with rotating-test CV only")
 
     runner(
         run=wandb_run,

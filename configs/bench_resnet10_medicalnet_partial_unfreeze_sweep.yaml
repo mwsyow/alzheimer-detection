@@ -12,7 +12,7 @@
 #   4: layer1-layer4 + classifier
 #   5: stem + layer1-layer4 + classifier (all parameters)
 
-program: train.py
+program: train_legacy.py
 entity: wmarcellius123
 project: alzheimer-detection
 method: grid
@@ -39,6 +39,6 @@ command:
   - run
   - --no-dev
   - python
-  - train.py
+  - train_legacy.py
   - --config
   - configs/bench_resnet10_medicalnet.json

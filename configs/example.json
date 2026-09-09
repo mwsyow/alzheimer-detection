@@ -1,5 +1,9 @@
 {
   "epochs": 50,
+  "seed": 42,
+  "task": {
+    "name": "ad_classification"
+  },
   "device": "auto",
   "wandb_entity": null,
   "wandb_project": "alzheimer-detection",
@@ -83,7 +87,8 @@
     "random_seed": 42
   },
   "cv": {
-    "enabled": false,
+    "enabled": true,
+    "strategy": "rotating_test",
     "n_splits": 5,
     "shuffle": true,
     "random_seed": 42
@@ -119,5 +124,8 @@
     "output_dir": "evaluations",
     "log_wandb": false,
     "save_predictions": true
+  },
+  "artifacts": {
+    "dir": "artifacts"
   }
 }

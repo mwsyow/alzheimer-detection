@@ -1177,11 +1177,23 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        required=True,
+        action="append",
+        default=[],
         help=(
             "A checkpoint file, or a run directory (checkpoints/<run_id>) to evaluate "
             "every cross-validation fold and report mean +/- std plus an ensemble."
         ),
+    )
+    parser.add_argument(
+        "--sweep-id",
+        default=None,
+        help="W&B entity/project/sweep id whose parent run IDs map under checkpoint-root.",
+    )
+    parser.add_argument(
+        "--checkpoint-root",
+        type=Path,
+        default=Path("checkpoints"),
+        help="Local/shared root used with --sweep-id.",
     )
     parser.add_argument(
         "--config",
@@ -1248,8 +1260,31 @@ def main():
     )
     args = parser.parse_args()
 
+    if bool(args.checkpoint) == bool(args.sweep_id):
+        parser.error("provide either one or more --checkpoint paths, or --sweep-id")
+    from rotating_evaluation import (
+        compare_rotating_runs,
+        evaluate_rotating_run,
+        sweep_run_dirs,
+    )
+
+    paths = (
+        sweep_run_dirs(args.sweep_id, args.checkpoint_root)
+        if args.sweep_id
+        else args.checkpoint
+    )
+    if len(paths) > 1 or args.sweep_id:
+        result = compare_rotating_runs(paths, Path("evaluations"))
+        print(f"Saved comparison to {result['output_dir']}")
+        return
+    args.checkpoint = paths[0]
+
     # A run directory means cross-validation: evaluate every fold on the shared test set.
     if args.checkpoint.is_dir():
+        directory_metadata = load_metadata(args.checkpoint / "metadata.pth")
+        if directory_metadata.get("cv", {}).get("strategy") == "rotating_test":
+            evaluate_rotating_run(args.checkpoint, log_wandb=args.log_wandb)
+            return
         evaluate_cv_run(args.checkpoint, args)
         return
 

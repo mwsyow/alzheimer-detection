@@ -26,22 +26,38 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import Subset
 
 
-def get_label(df: pd.DataFrame, path: Path):
-    subject_id = "_".join(str(path.name).split("_")[:3])
-    cdr = df[df["ID"] == subject_id]["CDR"].values[0]
-    return int(bool(cdr))
+def oasis_scan_id(path: Path) -> str:
+    return "_".join(path.name.split("_")[:3])
+
+
+def oasis_subject_id(scan_id: str) -> str:
+    """Return the person identifier, excluding the MR visit suffix."""
+    return scan_id.rsplit("_", 1)[0]
 
 
 def get_data(img_paths: list[Path], label_path: Path):
     df = pd.read_excel(label_path)
-    dataset_items = [
-        {
-            "label": get_label(df, path),
-            "image": str(path),
-            "image_id": str(path),
-        }
-        for path in img_paths
-    ]
+    required = {"ID", "CDR", "Age"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"OASIS metadata is missing columns: {sorted(missing)}")
+    rows = df.set_index("ID", verify_integrity=True)
+    dataset_items = []
+    for path in img_paths:
+        scan_id = oasis_scan_id(path)
+        if scan_id not in rows.index:
+            raise ValueError(f"No OASIS metadata row for image {path} ({scan_id})")
+        row = rows.loc[scan_id]
+        dataset_items.append(
+            {
+                "label": int(bool(row["CDR"])),
+                "age": float(row["Age"]),
+                "subject_id": oasis_subject_id(scan_id),
+                "scan_id": scan_id,
+                "image": str(path),
+                "image_id": str(path),
+            }
+        )
     return dataset_items
 
 
@@ -411,6 +427,122 @@ def build_cv_split_indices(dataset_items: list[dict], config: dict):
     return {"test_idx": test_idx, "folds": folds}
 
 
+def build_rotating_cv_split_indices(dataset_items: list[dict], config: dict) -> dict:
+    """Build subject-level K-fold rotations with K-2/train, 1/val and 1/test."""
+    cv_config = config["cv"]
+    n_splits = cv_config["n_splits"]
+    if not isinstance(n_splits, int) or isinstance(n_splits, bool) or n_splits < 3:
+        raise ValueError(f"cv.n_splits must be an integer >= 3, got {n_splits!r}")
+
+    subjects: dict[str, dict] = {}
+    for index, item in enumerate(dataset_items):
+        subject_id = str(item.get("subject_id", item.get("image_id", index)))
+        label = int(item["label"])
+        record = subjects.setdefault(subject_id, {"label": label, "indices": []})
+        if record["label"] != label:
+            raise ValueError(f"Subject {subject_id!r} has conflicting AD labels")
+        record["indices"].append(index)
+
+    ordered_subjects = sorted(subjects)
+    labels = [subjects[subject_id]["label"] for subject_id in ordered_subjects]
+    class_counts = pd.Series(labels).value_counts().to_dict()
+    if class_counts and min(class_counts.values()) < n_splits:
+        raise ValueError(
+            f"Each class needs at least cv.n_splits subjects; counts={class_counts}, "
+            f"n_splits={n_splits}"
+        )
+
+    manifest_path = cv_config.get("manifest_path")
+    if manifest_path:
+        manifest = pd.read_csv(manifest_path)
+        required = {"subject_id", "label", "fold"}
+        if required - set(manifest.columns):
+            raise ValueError(
+                f"Fold manifest is missing columns: {sorted(required - set(manifest.columns))}"
+            )
+        if manifest["subject_id"].duplicated().any():
+            raise ValueError("Fold manifest contains duplicate subject IDs")
+        if "n_splits" in manifest and set(manifest["n_splits"]) != {n_splits}:
+            raise ValueError("Fold manifest n_splits does not match cv.n_splits")
+        if "cv_random_seed" in manifest:
+            manifest_seeds = set(manifest["cv_random_seed"].dropna())
+            expected_seed = cv_config.get("random_seed")
+            if manifest_seeds and manifest_seeds != {expected_seed}:
+                raise ValueError(
+                    "Fold manifest cv_random_seed does not match cv.random_seed"
+                )
+        manifest_labels = dict(zip(manifest["subject_id"].astype(str), manifest["label"]))
+        if set(manifest_labels) != set(ordered_subjects):
+            raise ValueError("Fold manifest subjects do not exactly match the dataset")
+        for subject_id in ordered_subjects:
+            if int(manifest_labels[subject_id]) != subjects[subject_id]["label"]:
+                raise ValueError(f"Fold manifest label mismatch for {subject_id}")
+        subject_folds = {
+            str(subject_id): int(fold)
+            for subject_id, fold in zip(manifest["subject_id"], manifest["fold"])
+        }
+        if set(subject_folds.values()) != set(range(1, n_splits + 1)):
+            raise ValueError("Fold manifest does not contain exactly cv.n_splits folds")
+    else:
+        shuffle = cv_config.get("shuffle", True)
+        splitter = StratifiedKFold(
+            n_splits=n_splits,
+            shuffle=shuffle,
+            random_state=cv_config.get("random_seed") if shuffle else None,
+        )
+        subject_folds = {}
+        for fold_index, (_, test_positions) in enumerate(
+            splitter.split(ordered_subjects, labels), start=1
+        ):
+            for position in test_positions:
+                subject_folds[ordered_subjects[position]] = fold_index
+
+    rotations = []
+    all_folds = set(range(1, n_splits + 1))
+    for test_fold in range(1, n_splits + 1):
+        val_fold = test_fold % n_splits + 1
+
+        def indices_for(fold_numbers):
+            return sorted(
+                index
+                for subject_id, record in subjects.items()
+                if subject_folds[subject_id] in fold_numbers
+                for index in record["indices"]
+            )
+
+        train_idx = indices_for(all_folds - {test_fold, val_fold})
+        val_idx = indices_for({val_fold})
+        test_idx = indices_for({test_fold})
+        rotations.append(
+            {
+                "fold": test_fold,
+                "train_idx": train_idx,
+                "val_idx": val_idx,
+                "test_idx": test_idx,
+                "train_subject_ids": sorted(
+                    {str(dataset_items[index].get("subject_id", index)) for index in train_idx}
+                ),
+                "val_subject_ids": sorted(
+                    {str(dataset_items[index].get("subject_id", index)) for index in val_idx}
+                ),
+                "test_subject_ids": sorted(
+                    {str(dataset_items[index].get("subject_id", index)) for index in test_idx}
+                ),
+            }
+        )
+
+    return {
+        "strategy": "rotating_test",
+        "n_splits": n_splits,
+        "subject_folds": subject_folds,
+        "index_to_subject_id": {
+            index: str(item.get("subject_id", item.get("image_id", index)))
+            for index, item in enumerate(dataset_items)
+        },
+        "folds": rotations,
+    }
+
+
 # Every key build_transforms reads. A "transforms" block naming anything else is a
 # typo, and unlike model.params -- which reaches a constructor and raises TypeError --
 # an unrecognised transform key would otherwise be a silent no-op: the sweep runs to
@@ -651,9 +783,16 @@ def build_transforms(backend: DatasetBackend, config: dict, mode: str):
 
 
 class Dataset(MonaiDataset):
+    def __init__(self, *args, target_key: str = "label", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.target_key = target_key
+
     def __getitem__(self, index):
         item = super().__getitem__(index)
-        return item["image"], item["label"]
+        target = item[self.target_key]
+        if self.target_key == "age":
+            target = torch.as_tensor(target, dtype=torch.float32)
+        return item["image"], target
 
 
 class DatasetSource:
@@ -672,12 +811,22 @@ class DatasetSource:
         self.config = config
         self.backend = build_backend(config)
         self.items = self.backend.build_items()
+        task_name = config.get("task", {}).get("name", "ad_classification")
+        if task_name not in {"ad_classification", "age_regression"}:
+            raise ValueError(
+                f"Unsupported task {task_name!r}; expected ad_classification or "
+                "age_regression"
+            )
+        self.target_key = "age" if task_name == "age_regression" else "label"
+        if self.target_key == "age" and any("age" not in item for item in self.items):
+            raise ValueError("age_regression requires an age value for every sample")
         self._datasets: dict[str, Dataset] = {}
 
     def _build_dataset(self, mode: str) -> Dataset:
         return Dataset(
             data=self.items,
             transform=build_transforms(self.backend, self.config, mode),
+            target_key=self.target_key,
         )
 
     def dataset(self, mode: str) -> Dataset:
@@ -688,6 +837,17 @@ class DatasetSource:
 
     def item_id(self, index: int) -> str:
         return self.backend.item_id(self.items[index])
+
+    def subject_id(self, index: int) -> str:
+        item = self.items[index]
+        return str(item.get("subject_id", self.backend.item_id(item)))
+
+    def set_random_state(self, seed: int) -> None:
+        """Reset already-built MONAI Randomizable transforms for fold reproducibility."""
+        for dataset in self._datasets.values():
+            transform = getattr(dataset, "transform", None)
+            if hasattr(transform, "set_random_state"):
+                transform.set_random_state(seed=seed)
 
     def loader(self, indices: list[int], mode: str, shuffle: bool = False):
         dataloader_config = self.config["dataloader"]

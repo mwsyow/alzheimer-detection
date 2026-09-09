@@ -30,7 +30,7 @@
 #
 # 4 trials, each 5 folds = 20 child runs plus 4 parents.
 
-program: train.py
+program: train_legacy.py
 entity: wmarcellius123
 project: alzheimer-detection
 method: grid
@@ -51,6 +51,6 @@ command:
   - run
   - --no-dev
   - python
-  - train.py
+  - train_legacy.py
   - --config
   - configs/bench_efficientnet_b0.json

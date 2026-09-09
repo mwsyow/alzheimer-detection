@@ -155,6 +155,18 @@ class DenseNet121(BaseDenseNet121, PretrainedMixin):
         ("features.denseblock4", "features.norm5"),
     )
 
+    def forward_with_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self.features(x)
+        feature_map = self.class_layers.relu(x)
+        representation = self.class_layers.flatten(
+            self.class_layers.pool(feature_map)
+        )
+        output = self.class_layers.out(representation)
+        return {"F": feature_map, "hI": representation, "output": output}
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_features(x)["output"]
+
     def load_brat_weights(self, weights_path: str):
         """Load the DenseNet121 vision backbone from an official BRAT checkpoint."""
         checkpoint_path = Path(weights_path)
@@ -254,6 +266,19 @@ class ResNet10(BaseResNet, PretrainedMixin):
             num_classes=num_classes,
             **kwargs,
         )
+
+    def forward_with_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self.act(self.bn1(self.conv1(x)))
+        if not self.no_max_pool:
+            x = self.maxpool(x)
+        x = self.layer4(self.layer3(self.layer2(self.layer1(x))))
+        feature_map = x
+        representation = self.avgpool(feature_map).flatten(1)
+        output = self.fc(representation) if self.fc is not None else representation
+        return {"F": feature_map, "hI": representation, "output": output}
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_features(x)["output"]
 
     def load_medicalnet_weights(self):
         checkpoint_path = download_medicalnet_resnet10()
@@ -360,6 +385,19 @@ class EfficientNetBN(BaseEfficientNetBN, PretrainedMixin):
             **kwargs,
         )
 
+    def forward_with_features(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self._conv_stem(self._conv_stem_padding(inputs))
+        x = self._swish(self._bn0(x))
+        x = self._blocks(x)
+        x = self._conv_head(self._conv_head_padding(x))
+        feature_map = self._swish(self._bn1(x))
+        representation = self._avg_pooling(feature_map).flatten(1)
+        output = self._fc(self._dropout(representation))
+        return {"F": feature_map, "hI": representation, "output": output}
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_features(inputs)["output"]
+
 
 class EfficientNet(BaseEfficientNet, PretrainedMixin):
     """The full-control form: every regulariser and scaling coefficient is an argument.
@@ -420,6 +458,19 @@ class EfficientNet(BaseEfficientNet, PretrainedMixin):
             drop_connect_rate=pick(drop_connect_rate, drop_connect),
             **kwargs,
         )
+
+    def forward_with_features(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self._conv_stem(self._conv_stem_padding(inputs))
+        x = self._swish(self._bn0(x))
+        x = self._blocks(x)
+        x = self._conv_head(self._conv_head_padding(x))
+        feature_map = self._swish(self._bn1(x))
+        representation = self._avg_pooling(feature_map).flatten(1)
+        output = self._fc(self._dropout(representation))
+        return {"F": feature_map, "hI": representation, "output": output}
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_features(inputs)["output"]
 
 
 class EfficientNetB0(EfficientNetBN):
@@ -495,15 +546,23 @@ class Simple3DCNN(nn.Module):
             nn.init.zeros_(self.classifier.bias)
 
     def forward(self, x: torch.Tensor):
-        x = self.net(x)
-        x = x.flatten(1)
-        return self.classifier(x)
+        return self.forward_with_features(x)["output"]
+
+    def forward_with_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        feature_map = self.net[:-1](x)
+        representation = self.net[-1](feature_map).flatten(1)
+        output = self.classifier(representation)
+        return {"F": feature_map, "hI": representation, "output": output}
 
 
 def build_model(config, initialize_pretrained: bool = True):
     model_config = config["model"]
     model_name = model_config["name"]
     params = dict(model_config.get("params", {}))
+    task_name = config.get("task", {}).get("name", "ad_classification")
+    if task_name not in {"ad_classification", "age_regression"}:
+        raise ValueError(f"Unsupported task: {task_name!r}")
+    output_size = 1 if task_name == "age_regression" else 2
     pretrained = dict(model_config.get("pretrained", {}))
     pretrained_enabled = pretrained.get("enabled", pretrained.get("enable", False))
     pretrained_source = pretrained.get("source")
@@ -552,11 +611,14 @@ def build_model(config, initialize_pretrained: bool = True):
     # model does not accept is a TypeError at build time rather than a silent
     # no-op that costs a full run to discover.
     if model_name == "Simple3DCNN":
+        params["num_classes"] = output_size
         model = Simple3DCNN(**params)
     elif model_name == "DenseNet121":
         spatial_dims = params.pop("spatial_dims", 3)
         in_channels = params.pop("in_channels", 1)
-        out_channels = params.pop("out_channels", params.pop("num_classes", 2))
+        params.pop("num_classes", None)
+        params.pop("out_channels", None)
+        out_channels = output_size
         model = DenseNet121(
             spatial_dims=spatial_dims,
             in_channels=in_channels,
@@ -568,7 +630,9 @@ def build_model(config, initialize_pretrained: bool = True):
         # in_channels for parity with the other models; MONAI's ResNet spells it
         # n_input_channels.
         n_input_channels = params.pop("n_input_channels", params.pop("in_channels", 1))
-        num_classes = params.pop("num_classes", params.pop("out_channels", 2))
+        params.pop("num_classes", None)
+        params.pop("out_channels", None)
+        num_classes = output_size
         model = ResNet10(
             spatial_dims=spatial_dims,
             n_input_channels=n_input_channels,
@@ -578,7 +642,9 @@ def build_model(config, initialize_pretrained: bool = True):
     elif model_name in ("EfficientNet", "EfficientNetBN", "EfficientNetB0"):
         spatial_dims = params.pop("spatial_dims", 3)
         in_channels = params.pop("in_channels", 1)
-        num_classes = params.pop("num_classes", params.pop("out_channels", 2))
+        params.pop("num_classes", None)
+        params.pop("out_channels", None)
+        num_classes = output_size
         efficientnet_class = {
             "EfficientNet": EfficientNet,
             "EfficientNetBN": EfficientNetBN,

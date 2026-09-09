@@ -12,7 +12,7 @@
 #   4: denseblock1-transition1 through the tail + classifier
 #   5: stem + all dense stages + classifier (all parameters)
 
-program: train.py
+program: train_legacy.py
 entity: wmarcellius123
 project: alzheimer-detection
 method: grid
@@ -40,6 +40,6 @@ command:
   - run
   - --no-dev
   - python
-  - train.py
+  - train_legacy.py
   - --config
   - configs/bench_densenet121.json

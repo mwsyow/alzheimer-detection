@@ -10,6 +10,7 @@ from sklearn.metrics import (
     precision_score,
     roc_auc_score,
     roc_curve,
+    r2_score,
 )
 from torch import nn
 
@@ -79,6 +80,10 @@ WANDB_METRIC_LABELS = {
     "npv": "NPV",
     "fpr": "FPR",
     "threshold": "Threshold",
+    "mae": "MAE",
+    "rmse": "RMSE",
+    "r2": "R2",
+    "pearson_r": "Pearson r",
 }
 
 # What training logs each epoch, for both splits. Every one of these is threshold-free:
@@ -86,6 +91,7 @@ WANDB_METRIC_LABELS = {
 # once, in evaluate.py, from the validation predictions the checkpoints carry -- which is
 # the only place it can be applied to data it was not chosen on.
 EPOCH_LOG_METRICS = ("loss", "roc_auc", "average_precision")
+REGRESSION_EPOCH_LOG_METRICS = ("loss", "mae", "rmse")
 
 
 def summarize_predictions(
@@ -100,6 +106,17 @@ def summarize_predictions(
     weights.
     """
     logits = logits.detach().cpu().float()
+    if getattr(loss_fn, "task_name", None) == "age_regression":
+        labels = labels.detach().cpu().float().reshape(-1)
+        predictions = logits.reshape(-1)
+        loss = loss_fn(logits, labels).item()
+        return {
+            "loss": loss,
+            "outputs": logits,
+            "y_true": labels.numpy(),
+            "y_pred": loss_fn.inverse(predictions).numpy(),
+        }
+
     labels = labels.detach().cpu().long()
 
     weight = getattr(loss_fn, "weight", None)
@@ -112,6 +129,28 @@ def summarize_predictions(
         "y_true": labels.numpy(),
         "y_prob": logits.softmax(dim=1)[:, 1].numpy(),
     }
+
+
+def regression_metrics(y_true, y_pred, loss: float = None) -> dict:
+    """Regression metrics in the original target units (years for OASIS age)."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    residual = y_pred - y_true
+    pearson = None
+    if len(y_true) > 1 and np.std(y_true) > 0 and np.std(y_pred) > 0:
+        pearson = float(np.corrcoef(y_true, y_pred)[0, 1])
+    metrics = {
+        "mae": float(np.mean(np.abs(residual))),
+        "rmse": float(np.sqrt(np.mean(np.square(residual)))),
+        "r2": float(r2_score(y_true, y_pred)) if len(y_true) > 1 else None,
+        "pearson_r": pearson,
+        "n": int(len(y_true)),
+        "prediction_mean": float(np.mean(y_pred)),
+        "prediction_std": float(np.std(y_pred)),
+    }
+    if loss is not None:
+        metrics["loss"] = float(loss)
+    return metrics
 
 
 def collect_predictions(

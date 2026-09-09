@@ -40,6 +40,14 @@ parameters:
   epochs:
     value: 50
 
+  # Training randomness and partition randomness are independent hyperparameters.
+  # Use any values/combination your experiment requires.
+  seed:
+    value: 42
+
+  cv.random_seed:
+    values: [42, 1337, 7, 2024]
+
   dataloader.batch_size:
     value: 5
 
@@ -76,8 +84,10 @@ parameters:
   # Enabling this multiplies runtime by n_splits and produces K+1 wandb runs per
   # trial: one parent holding the objective, plus one child per fold. Children never
   # write the objective key, so they cannot win sweep.best_run().
-  # cv.enabled:
-  #   value: true
+  cv.enabled:
+    value: true
+  cv.strategy:
+    value: rotating_test
   # cv.n_splits:
   #   value: 5
 

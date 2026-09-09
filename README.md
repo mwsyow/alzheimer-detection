@@ -1,4 +1,9 @@
-# Alzheimer MRI Classification
+# Alzheimer MRI Classification and Regression
+
+The primary protocol is subject-level rotating-test cross-validation. Each K-fold
+rotation uses K-2 folds for training, one for validation and one for testing, producing
+one OOF test prediction per subject and CV partition seed. AD classification and age
+regression share the same AD-stratified subject partitions.
 
 This project trains 3D CNN models on OASIS MRI data for binary Alzheimer/CDR classification. The MRI volumes are loaded from Analyze/NIfTI-style image files with MONAI/Nibabel transforms, labels are read from the cleaned OASIS spreadsheet, and training metrics/checkpoints are tracked with Weights & Biases.
 
@@ -15,21 +20,20 @@ Documentation lives in three places: this file for the workflow end to end,
 
 ## Code Flow
 
-The main entrypoint is `train.py`.
+The main entrypoint is `train.py`. Historical fixed-test, single-split and refit runs
+remain available through `train_legacy.py`.
 
 1. Load the JSON config named by `--config` (required; start from `configs/example.json`).
 2. Initialize a W&B run, appending its unique run ID to the configured `wandb_name`.
 3. Apply W&B sweep overrides, if the run is launched by a sweep.
-4. Load MRI paths and labels.
-5. Pick the split mode from the config — single train/validation/test split,
-   `cv` (stratified K-fold over pooled train+val, fixed test set), or
-   `refit` (train+val pooled into one training set, no validation).
+4. Load MRI paths, subject IDs, AD labels, and ages.
+5. Build AD-stratified subject folds from `cv.random_seed`, then rotate K-2 training
+   folds, one validation fold, and one test fold.
 6. Build MONAI transforms, datasets, dataloaders, model, loss, and optimizer.
-7. Train while logging metrics to W&B. Each epoch logs `Loss`, `AUC` and
-   `Average Precision` only — training picks no decision threshold.
-8. Save checkpoints under `checkpoints/<wandb_run_id>/`.
+7. Train while logging threshold-free classification or age-regression metrics.
+8. Save checkpoints, fold manifests, and per-subject F/hI artifacts.
 
-Single-split and refit runs write:
+Historical single-split and refit runs launched through `train_legacy.py` write:
 
 - `metadata.pth`: static run metadata, config, and split indices.
 - `last.pth`: latest completed epoch, used for interruption recovery.
@@ -62,6 +66,25 @@ The config controls model params, optimizer params, transforms, dataloader setti
 an optional batch-level warmup/cosine learning-rate schedule,
 splitting and cross-validation, checkpointing, early stopping, threshold selection, and
 W&B settings. See [`configs/README.md`](configs/README.md) for every key.
+
+## Rotating OOF evaluation
+
+```bash
+uv run python evaluate.py --checkpoint checkpoints/<run_id>
+uv run python evaluate.py --checkpoint checkpoints/<run1> --checkpoint checkpoints/<run2>
+uv run python evaluate.py --sweep-id <entity>/<project>/<sweep> --checkpoint-root checkpoints
+```
+
+The evaluator selects one threshold from each rotation's validation predictions and
+applies it only to that rotation's test subjects. It pools all OOF probabilities for
+ROC-AUC and AP, and pools the fold-local decisions for thresholded metrics.
+
+Export reusable fold assignments for tabular models with:
+
+```bash
+uv run python generate_cv_manifest.py --config configs/example.json \
+  --output splits/oasis1_seed42.csv
+```
 
 ## Resume Training
 

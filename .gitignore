@@ -40,3 +40,5 @@ condor/*
 !condor/sync_to_hpc.sh
 
 reports/
+
+artifacts/
