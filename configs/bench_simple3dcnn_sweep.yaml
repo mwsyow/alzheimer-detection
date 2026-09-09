@@ -15,14 +15,12 @@ metric:
   goal: maximize
 
 parameters:
-  seed:
-    values: [42, 1337, 7, 2024]
   cv.strategy:
     value: rotating_test
   cv.n_splits:
     value: 5
   cv.random_seed:
-    value: 42
+    value: [42, 1337, 7, 2024]
 
 command:
   - ${env}
