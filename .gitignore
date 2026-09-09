@@ -34,6 +34,7 @@ configs/*
 # too, so without these the only surviving record is metadata.pth inside runs.
 !configs/bench_*.json
 !configs/bench_*_sweep.yaml
+!configs/bench_*_legacy.yaml
 
 condor/*
 !condor/README.md

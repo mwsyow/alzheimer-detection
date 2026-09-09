@@ -1,0 +1,45 @@
+# Stage-1 screen: how much of the pretrained DenseNet121 backbone should be unfrozen?
+#
+# Hold the benchmark recipe and CV seed fixed so this screen isolates unfreezing depth.
+# After it completes, take the two highest depths by parent Best Validation AUC, union
+# them with endpoints 0 and 5, and rerun the deduplicated depths at seeds
+# [42, 1337, 7, 2024].
+#
+#   0: classifier only
+#   1: denseblock4 + final norm + classifier
+#   2: denseblock3-transition3 through the tail + classifier
+#   3: denseblock2-transition2 through the tail + classifier
+#   4: denseblock1-transition1 through the tail + classifier
+#   5: stem + all dense stages + classifier (all parameters)
+
+program: train_legacy.py
+entity: wmarcellius123
+project: alzheimer-detection
+method: grid
+
+metric:
+  name: Best Validation AUC
+  goal: maximize
+
+parameters:
+  model.pretrained.freeze_backbone:
+    value: true
+  model.pretrained.unfreeze_last_stages:
+    values: [0, 1, 2, 3, 4, 5]
+  cv.random_seed:
+    value: 42
+  early_stopping.enabled:
+    value: true
+  early_stopping.patience:
+    value: 20
+  
+
+command:
+  - ${env}
+  - uv
+  - run
+  - --no-dev
+  - python
+  - train_legacy.py
+  - --config
+  - configs/bench_densenet121_legacy.json

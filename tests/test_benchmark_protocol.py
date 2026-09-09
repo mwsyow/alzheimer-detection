@@ -16,6 +16,7 @@ import json
 import os
 
 import pytest
+import yaml
 
 from datasets import resolve_split_mode
 from models import build_model
@@ -24,7 +25,20 @@ from models import build_model
 # deliberately differs on epochs and cv.enabled: it has no validation split, so the
 # equal-draws reasoning behind the shared epoch budget does not apply to it. Each family
 # is held to its own protocol, and every refit is checked against its own CV sibling.
-ALL_BENCH = sorted(glob.glob("configs/bench_*.json"))
+ALL_BENCH = sorted(
+    path
+    for path in glob.glob("configs/bench_*.json")
+    if not path.endswith("_legacy.json")
+)
+LEGACY_BENCH = sorted(
+    glob.glob("configs/bench_*_legacy.json")
+    + glob.glob("configs/bench_*_legacy.yaml")
+)
+ACTIVE_SWEEPS = sorted(
+    path
+    for path in glob.glob("configs/bench_*_sweep.yaml")
+    if not path.endswith("_legacy.yaml")
+)
 REFIT_SUFFIX = "_refit.json"
 BENCH = [p for p in ALL_BENCH if not p.endswith(REFIT_SUFFIX)]
 REFIT = [p for p in ALL_BENCH if p.endswith(REFIT_SUFFIX)]
@@ -37,13 +51,16 @@ def cv_sibling(refit_path):
 # Fields that must be byte-identical across every arm.
 PROTOCOL_FIELDS = [
     "epochs",
+    "seed",
+    "task",
     "early_stopping",
     "dataloader",
     "cv",
-    "split",
     "transforms",
     "dataset",
     "threshold",
+    "evaluation",
+    "artifacts",
 ]
 # Nested fields that must match, given as dotted paths.
 PROTOCOL_NESTED = [
@@ -121,13 +138,45 @@ def test_the_protocol_values_are_the_ones_the_benchmark_specifies():
         assert c["dataloader"]["batch_size"] == 8, (
             f"{path}: batch size is protocol, not tuned"
         )
+        assert c["seed"] == 42, f"{path}: default training seed"
+        assert c["task"] == {"name": "ad_classification"}, f"{path}: task"
+        assert "split" not in c, f"{path}: fixed-test split is legacy-only"
         assert c["cv"]["enabled"] and c["cv"]["n_splits"] == 5, f"{path}: 5-fold CV"
-        assert c["split"]["random_seed"] == 42, (
-            f"{path}: the test split must never move"
-        )
+        assert c["cv"]["strategy"] == "rotating_test", f"{path}: rotating test CV"
+        assert c["cv"]["random_seed"] == 42, f"{path}: folds must remain fixed"
+        assert c["artifacts"] == {"dir": "artifacts"}, f"{path}: feature output"
         assert c["transforms"]["spatial_size"] == [96, 128, 96], (
             f"{path}: shared input size"
         )
+
+
+def test_active_sweeps_use_training_seed_and_fixed_rotating_folds():
+    assert len(ACTIVE_SWEEPS) == 8
+    for path in ACTIVE_SWEEPS:
+        with open(path) as handle:
+            sweep = yaml.safe_load(handle)
+        assert sweep["program"] == "train.py", path
+        assert "train_legacy.py" not in sweep["command"], path
+        assert sweep["parameters"]["cv.strategy"]["value"] == "rotating_test", path
+        assert sweep["parameters"]["cv.n_splits"]["value"] == 5, path
+        assert sweep["parameters"]["cv.random_seed"]["value"] == 42, path
+        seed = sweep["parameters"]["seed"]
+        if "partial_unfreeze" in path:
+            assert seed["value"] == 42, path
+        else:
+            assert seed["values"] == [42, 1337, 7, 2024], path
+
+
+def test_legacy_benchmark_files_are_preserved_and_clearly_named():
+    assert len(LEGACY_BENCH) == 19
+    assert all("_legacy." in path for path in LEGACY_BENCH)
+    for path in glob.glob("configs/bench_*_sweep_legacy.yaml"):
+        with open(path) as handle:
+            sweep = yaml.safe_load(handle)
+        assert sweep["program"] == "train_legacy.py", path
+        config_path = sweep["command"][-1]
+        assert config_path.endswith("_legacy.json"), path
+        assert os.path.exists(config_path), path
 
 
 def test_no_augmentation_anywhere():

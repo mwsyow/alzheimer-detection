@@ -8,10 +8,10 @@ uv run python train.py --config configs/my_config.json
 ```
 
 `configs/` is gitignored apart from `example.json`, `example_sweep.yaml`, this file and
-the `bench_*.json` / `bench_*_sweep.yaml` benchmark arms, so your own configs stay local.
-The benchmark configs are tracked because they are the audit trail for the architecture
-comparison — they record the exact protocol every arm ran under, and `checkpoints/` is
-gitignored.
+the tracked `bench_*` benchmark families, so your own configs stay local. Benchmark
+filenames without `_legacy` use rotating-test CV. Their historical fixed-test versions
+are preserved with `_legacy` immediately before the extension. These files are the audit
+trail for the architecture comparison because `checkpoints/` is gitignored.
 
 ---
 

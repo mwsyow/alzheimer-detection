@@ -56,12 +56,17 @@
     "rand_scale_intensity": false,
     "rand_shift_intensity": false
   },
+  "split": {
+    "train_size": 0.7,
+    "val_size": 0.15,
+    "test_size": 0.15,
+    "random_seed": 42
+  },
   "cv": {
     "enabled": true,
     "n_splits": 5,
     "shuffle": true,
-    "random_seed": 42,
-    "strategy": "rotating_test"
+    "random_seed": 42
   },
   "dataloader": {
     "batch_size": 8,
@@ -91,12 +96,5 @@
     "output_dir": "evaluations",
     "log_wandb": false,
     "save_predictions": true
-  },
-  "seed": 42,
-  "task": {
-    "name": "ad_classification"
-  },
-  "artifacts": {
-    "dir": "artifacts"
   }
 }

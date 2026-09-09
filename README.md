@@ -13,6 +13,8 @@ pretrained, and DenseNet121 from scratch. The `configs/bench_*.json` files are t
 trail for that comparison — `checkpoints/` is gitignored, so they are the only tracked
 record of the protocol each arm ran under — and `tests/test_benchmark_protocol.py`
 asserts the shared protocol block stays identical across them.
+The active benchmark filenames use rotating-test CV; the previous fixed-test JSON/YAML
+files are preserved with `_legacy` before the extension and invoke `train_legacy.py`.
 
 Documentation lives in three places: this file for the workflow end to end,
 [`configs/README.md`](configs/README.md) for every config key, and
@@ -213,8 +215,11 @@ Sweep hyperparameters are injected through `wandb.config` and merged into the ne
 ```text
 optimizer.params.lr
 dataloader.batch_size
-cv.random_seed
+seed
 ```
+
+The benchmark seed sweeps vary top-level `seed` while pinning `cv.random_seed`, so model
+initialization and data-order uncertainty are measured on identical subject folds.
 
 Each sweep trial gets its own W&B run ID, so checkpoints are isolated under:
 

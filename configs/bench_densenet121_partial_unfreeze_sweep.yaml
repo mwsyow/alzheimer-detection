@@ -1,18 +1,11 @@
-# Stage-1 screen: how much of the pretrained DenseNet121 backbone should be unfrozen?
-#
-# Hold the benchmark recipe and CV seed fixed so this screen isolates unfreezing depth.
-# After it completes, take the two highest depths by parent Best Validation AUC, union
-# them with endpoints 0 and 5, and rerun the deduplicated depths at seeds
-# [42, 1337, 7, 2024].
-#
-#   0: classifier only
-#   1: denseblock4 + final norm + classifier
-#   2: denseblock3-transition3 through the tail + classifier
-#   3: denseblock2-transition2 through the tail + classifier
-#   4: denseblock1-transition1 through the tail + classifier
-#   5: stem + all dense stages + classifier (all parameters)
+# Rotating-test benchmark: DenseNet121 partial-unfreezing screen.
+# cv.random_seed is fixed so every architecture and model seed uses identical subject
+# folds. Top-level seed controls initialization, data order, workers, and augmentation.
+# Each trial rotates 3 train + 1 validation + 1 test fold, giving one OOF test
+# prediction per subject. Run evaluate.py on each completed parent checkpoint directory
+# to compute pooled OOF ROC-AUC and the remaining test metrics.
 
-program: train_legacy.py
+program: train.py
 entity: wmarcellius123
 project: alzheimer-detection
 method: grid
@@ -22,17 +15,22 @@ metric:
   goal: maximize
 
 parameters:
+  seed:
+    value: 42
   model.pretrained.freeze_backbone:
     value: true
   model.pretrained.unfreeze_last_stages:
     values: [0, 1, 2, 3, 4, 5]
-  cv.random_seed:
-    value: 42
   early_stopping.enabled:
     value: true
   early_stopping.patience:
     value: 20
-  
+  cv.strategy:
+    value: rotating_test
+  cv.n_splits:
+    value: 5
+  cv.random_seed:
+    value: 42
 
 command:
   - ${env}
@@ -40,6 +38,6 @@ command:
   - run
   - --no-dev
   - python
-  - train_legacy.py
+  - train.py
   - --config
   - configs/bench_densenet121.json

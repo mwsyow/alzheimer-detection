@@ -4,36 +4,42 @@
   "wandb_entity": null,
   "wandb_project": "alzheimer-detection",
   "wandb_mode": "online",
-  "wandb_name": "bench-densenet121-scratch",
+  "wandb_name": "bench-efficientnet-b0",
   "dataset": {
     "name": "oasis",
     "image_glob": "data/T88_111_masked/*masked_gfc.img",
     "label_path": "data/oasis_cross-sectional_cdr_cleaned.xlsx"
   },
   "model": {
-    "name": "DenseNet121",
+    "name": "EfficientNetBN",
     "params": {
       "num_classes": 2,
       "in_channels": 1,
-      "spatial_dims": 3
+      "spatial_dims": 3,
+      "model_name": "efficientnet-b0",
+      "norm": [
+        "batch",
+        {
+          "momentum": 0.1,
+          "eps": 0.001
+        }
+      ]
     },
     "pretrained": {
-      "enabled": false,
-      "pretrained_weights_path": null,
-      "freeze_backbone": false
+      "enabled": false
     }
   },
   "loss": {
     "name": "CrossEntropyLoss",
     "params": {
-      "label_smoothing": 0.0
+      "label_smoothing": 0.1
     }
   },
   "optimizer": {
     "name": "AdamW",
     "params": {
       "lr": 0.0001,
-      "weight_decay": 0.01
+      "weight_decay": 0.1
     }
   },
   "transforms": {
@@ -56,12 +62,17 @@
     "rand_scale_intensity": false,
     "rand_shift_intensity": false
   },
+  "split": {
+    "train_size": 0.7,
+    "val_size": 0.15,
+    "test_size": 0.15,
+    "random_seed": 42
+  },
   "cv": {
     "enabled": true,
     "n_splits": 5,
     "shuffle": true,
-    "random_seed": 42,
-    "strategy": "rotating_test"
+    "random_seed": 42
   },
   "dataloader": {
     "batch_size": 8,
@@ -91,12 +102,5 @@
     "output_dir": "evaluations",
     "log_wandb": false,
     "save_predictions": true
-  },
-  "seed": 42,
-  "task": {
-    "name": "ad_classification"
-  },
-  "artifacts": {
-    "dir": "artifacts"
   }
 }
