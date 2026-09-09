@@ -16,7 +16,8 @@ data/
 *.ipynb
 *.pdf
 *.xlsx
-scripts/
+scripts/*
+!scripts/preprocess_unified.py
 wandb/
 checkpoints/
 evaluations/
