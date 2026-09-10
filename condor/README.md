@@ -1,5 +1,8 @@
 # Running on the SIC HTCondor cluster
 
+To transfer an entire sweep as one archive grouped by configuration, see
+[sweep bundles](../docs/sweep_bundles.md).
+
 Tooling for getting this project onto the Saarland CS HPC cluster and running jobs
 there. Source for the cluster facts below: `data/CS_HPC_Docu.pdf`.
 
