@@ -17,7 +17,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from metrics import regression_metrics, select_cv_thresholds
+from metrics import regression_metrics, select_cv_thresholds, per_fold_threshold_operating_point
 from tasks import adaptation_mode, is_regression
 from train import load_metadata
 
@@ -39,11 +39,12 @@ CALIBRATION_INCLUSIVE_NOTE = (
 
 
 def _shared_threshold_selection(
-    manifest: pd.DataFrame, n_splits: int, threshold_config: dict, expected: set[str]
+    manifest: pd.DataFrame, n_splits: int, threshold_config: dict, expected: set[str],
+    threshold_mode: str = "unified",
 ) -> tuple[dict, int]:
     """Choose one cut from every fold's validation predictions, never test rows."""
     strategy = threshold_config.get("strategy", "cv_common_threshold")
-    if strategy != "cv_common_threshold":
+    if threshold_mode == "unified" and strategy != "cv_common_threshold":
         raise ValueError(
             "Rotating-test evaluation requires threshold.strategy="
             f"'cv_common_threshold', got {strategy!r}"
@@ -55,6 +56,9 @@ def _shared_threshold_selection(
         rows = manifest[
             (manifest["fold"] == fold) & (manifest["split"] == "validation")
         ]
+        test_subjects = set(manifest.loc[(manifest["fold"] == fold) & (manifest["split"] == "test"), "subject_id"])
+        if set(rows["subject_id"]) & test_subjects:
+            raise ValueError(f"Fold {fold} validation and test subjects overlap")
         payloads = _payloads(rows)
         if not payloads:
             raise ValueError(f"Fold {fold} has no validation artifacts")
@@ -73,8 +77,9 @@ def _shared_threshold_selection(
             "Validation artifacts do not cover every manifest subject exactly once"
         )
 
-    selection = select_cv_thresholds(
-        strategy="cv_common_threshold",
+    selector = per_fold_threshold_operating_point if threshold_mode == "per-fold" else select_cv_thresholds
+    selection = selector(
+        **({"strategy": "cv_common_threshold"} if threshold_mode == "unified" else {}),
         fold_predictions=fold_predictions,
         objective=threshold_config.get("objective", "balanced_accuracy"),
         num_thresholds=int(threshold_config.get("num_thresholds", 1000)),
@@ -93,12 +98,12 @@ def _save_threshold_selection(
     record = {key: value for key, value in selection.items() if key != "curve"}
     record.update(
         {
-            "threshold": float(selection["shared_threshold"]),
-            "threshold_source": "all_validation_folds",
+            "threshold": selection["shared_threshold"],
+            "threshold_source": "all_validation_folds" if selection["shared_threshold"] is not None else "own_validation_fold",
             "validation_folds": sorted(selection["fold_thresholds"]),
             "validation_subjects": int(validation_subjects),
-            "thresholded_metrics_calibration_inclusive": True,
-            "calibration_note": CALIBRATION_INCLUSIVE_NOTE,
+            "thresholded_metrics_calibration_inclusive": selection["shared_threshold"] is not None,
+            "calibration_note": CALIBRATION_INCLUSIVE_NOTE if selection["shared_threshold"] is not None else "Each test fold uses only its own model's disjoint validation subjects for threshold selection.",
             "artifacts": {
                 "threshold_selection": str(selection_path),
                 "threshold_curve": str(curve_path),
@@ -135,8 +140,11 @@ def _classification_metrics(y_true, y_prob, y_pred) -> dict:
 
 
 def evaluate_rotating_run(
-    run_dir: Path, output_dir: Path | None = None, log_wandb: bool = False
+    run_dir: Path, output_dir: Path | None = None, log_wandb: bool = False,
+    threshold_mode: str = "unified",
 ) -> dict:
+    if threshold_mode not in {"unified", "per-fold"}:
+        raise ValueError(f"Unknown threshold mode: {threshold_mode}")
     metadata = load_metadata(run_dir / "metadata.pth")
     cv = metadata.get("cv", {})
     if cv.get("strategy") != "rotating_test":
@@ -185,13 +193,15 @@ def evaluate_rotating_run(
             cv["n_splits"],
             config.get("threshold", {}),
             expected,
+            threshold_mode,
         )
-        threshold = float(threshold_selection["shared_threshold"])
         for fold in range(1, cv["n_splits"] + 1):
+            threshold = float(threshold_selection["fold_thresholds"][fold])
+            threshold_source = "all_validation_folds" if threshold_mode == "unified" else "own_validation_fold"
             thresholds[fold] = {
                 "threshold": threshold,
-                "strategy": "cv_common_threshold",
-                "threshold_source": "all_validation_folds",
+                "strategy": threshold_selection["strategy"],
+                "threshold_source": threshold_source,
             }
             fold_test = test_rows[test_rows["fold"] == fold]
             for payload in _payloads(fold_test):
@@ -204,7 +214,7 @@ def evaluate_rotating_run(
                         "probability": probability,
                         "prediction": int(probability >= threshold),
                         "threshold": threshold,
-                        "threshold_source": "all_validation_folds",
+                        "threshold_source": threshold_source,
                         "fold": fold,
                         "seed": int(payload["seed"]),
                         "cv_random_seed": payload["cv_random_seed"],
@@ -223,6 +233,8 @@ def evaluate_rotating_run(
 
     output_dir = output_dir or Path(config.get("evaluation", {}).get("output_dir", "evaluations"))
     destination = output_dir / metadata["run_id"]
+    if threshold_mode == "per-fold" and not is_regression(config):
+        destination = destination / "per-fold"
     destination.mkdir(parents=True, exist_ok=True)
     frame.to_csv(destination / "oof_predictions.csv", index=False)
     threshold_record = (
@@ -249,6 +261,7 @@ def evaluate_rotating_run(
         "metrics": metrics,
     }
     if threshold_record is not None:
+        summary["threshold_mode"] = threshold_mode
         summary["threshold_selection"] = threshold_record
     with (destination / "oof_metrics.json").open("w") as handle:
         json.dump(summary, handle, indent=2)
@@ -265,14 +278,17 @@ def evaluate_rotating_run(
             mode=config.get("wandb_mode", "online"),
             reinit="create_new",
         )
+        namespace = "OOF" if threshold_mode == "unified" or is_regression(config) else "OOF Per-fold"
         for key, value in metrics.items():
             if isinstance(value, (int, float)) and value is not None:
-                run.summary[f"OOF Test {key}"] = value
-        run.summary["OOF Predictions"] = str(destination / "oof_predictions.csv")
+                run.summary[f"{namespace} Test {key}"] = value
+        run.summary[f"{namespace} Predictions"] = str(destination / "oof_predictions.csv")
         if threshold_record is not None:
-            run.summary["OOF Shared Threshold"] = threshold_record["threshold"]
-            run.summary["OOF Threshold Calibration Inclusive"] = True
-            run.summary["OOF Threshold Selection"] = str(
+            run.summary[f"{namespace} Thresholds"] = {str(k): v["threshold"] for k, v in thresholds.items()}
+            if threshold_mode == "unified":
+                run.summary["OOF Shared Threshold"] = threshold_record["threshold"]
+            run.summary[f"{namespace} Threshold Calibration Inclusive"] = threshold_record["thresholded_metrics_calibration_inclusive"]
+            run.summary[f"{namespace} Threshold Selection"] = str(
                 destination / "threshold_selection.json"
             )
         run.finish()
@@ -293,8 +309,8 @@ def sweep_run_dirs(sweep_id: str, checkpoint_root: Path) -> list[Path]:
     return paths
 
 
-def compare_rotating_runs(run_dirs: list[Path], output_dir: Path) -> dict:
-    summaries = [evaluate_rotating_run(path, output_dir=output_dir) for path in run_dirs]
+def compare_rotating_runs(run_dirs: list[Path], output_dir: Path, threshold_mode: str = "unified", log_wandb: bool = False) -> dict:
+    summaries = [evaluate_rotating_run(path, output_dir=output_dir, threshold_mode=threshold_mode, log_wandb=log_wandb) for path in run_dirs]
     tasks = {summary["task"] for summary in summaries}
     if len(tasks) != 1:
         raise ValueError(f"Cannot aggregate mixed tasks: {sorted(tasks)}")
@@ -307,7 +323,10 @@ def compare_rotating_runs(run_dirs: list[Path], output_dir: Path) -> dict:
         }
         if "threshold_selection" in summary:
             row["threshold"] = summary["threshold_selection"]["threshold"]
-            row["thresholded_metrics_calibration_inclusive"] = True
+            row["threshold_mode"] = threshold_mode
+            row["thresholded_metrics_calibration_inclusive"] = summary["threshold_selection"].get("thresholded_metrics_calibration_inclusive", True)
+            if threshold_mode == "per-fold":
+                row["fold_thresholds"] = json.dumps(summary["threshold_selection"]["fold_thresholds"], sort_keys=True)
         row["best_epochs"] = json.dumps(row["best_epochs"])
         row.update(summary["metrics"])
         row.pop("confusion_matrix", None)
@@ -319,9 +338,13 @@ def compare_rotating_runs(run_dirs: list[Path], output_dir: Path) -> dict:
         if column not in {"seed", "cv_random_seed", "folds", "n"}
     ]
     groups = ["task", "architecture", "adaptation_mode", "comparison_sha256"]
+    if "threshold_mode" in frame:
+        groups.append("threshold_mode")
     aggregate = frame.groupby(groups, dropna=False)[metric_columns].agg(["mean", "std"])
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", "-".join(path.name for path in run_dirs[:3]))
     destination = output_dir / "comparisons" / slug
+    if threshold_mode == "per-fold" and "threshold_mode" in frame:
+        destination = output_dir / "comparisons" / f"{slug}--per-fold"
     destination.mkdir(parents=True, exist_ok=True)
     frame.to_csv(destination / "runs.csv", index=False)
     aggregate.to_csv(destination / "aggregate.csv")

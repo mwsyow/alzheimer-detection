@@ -258,6 +258,18 @@ def test_rotating_training_exports_and_evaluates_one_oof_row_per_subject(
     curve = pd.read_csv(destination / "threshold_curve.csv")
     assert len(curve) == cfg["threshold"]["num_thresholds"]
 
+    per_fold = evaluate_rotating_run(run_dir, tmp_path / "evaluations", threshold_mode="per-fold")
+    per_predictions = pd.read_csv(destination / "per-fold" / "oof_predictions.csv")
+    for metric in ("roc_auc", "average_precision"):
+        assert per_fold["metrics"][metric] == pytest.approx(summary["metrics"][metric])
+    assert not per_fold["threshold_selection"]["thresholded_metrics_calibration_inclusive"]
+    for fold, rows in per_predictions.groupby("fold"):
+        threshold = per_fold["thresholds"][fold]["threshold"]
+        assert (rows.threshold == threshold).all()
+        assert (rows.prediction == (rows.probability >= threshold).astype(int)).all()
+    assert set(per_predictions.threshold_source) == {"own_validation_fold"}
+    assert pd.read_csv(destination / "oof_predictions.csv").equals(predictions)
+
     # Test predictions affect reported metrics, never the validation-selected cut.
     for artifact in manifest.loc[manifest["split"] == "test", "artifact"]:
         payload = torch.load(artifact, map_location="cpu", weights_only=False)
@@ -265,6 +277,8 @@ def test_rotating_training_exports_and_evaluates_one_oof_row_per_subject(
         torch.save(payload, artifact)
     repeated = evaluate_rotating_run(run_dir, tmp_path / "reevaluated")
     assert repeated["threshold_selection"]["shared_threshold"] == pytest.approx(shared)
+    repeated_per_fold = evaluate_rotating_run(run_dir, tmp_path / "reevaluated", threshold_mode="per-fold")
+    assert repeated_per_fold["thresholds"] == per_fold["thresholds"]
 
 
 def test_age_rotating_training_saves_scalers_and_real_year_predictions(
@@ -300,7 +314,7 @@ def test_age_rotating_training_saves_scalers_and_real_year_predictions(
 def test_rotating_comparison_keeps_only_scalar_threshold_provenance(
     tmp_path, monkeypatch
 ):
-    def summary(path, output_dir):
+    def summary(path, output_dir, **kwargs):
         threshold = 0.25 if path.name == "run-a" else 0.75
         return {
             "run_id": path.name,
@@ -329,3 +343,24 @@ def test_rotating_comparison_keeps_only_scalar_threshold_provenance(
     assert "threshold_selection" not in runs
     assert runs["threshold"].tolist() == [0.25, 0.75]
     assert runs["thresholded_metrics_calibration_inclusive"].all()
+
+
+def test_per_fold_comparison_separates_outputs_and_forwards_logging(tmp_path, monkeypatch):
+    calls = []
+    def summary(path, output_dir, threshold_mode, log_wandb):
+        calls.append((threshold_mode, log_wandb))
+        return {"run_id": path.name, "task": "ad_classification",
+                "architecture": "Simple3DCNN", "adaptation_mode": "scratch",
+                "comparison_sha256": "same", "seed": 42, "cv_random_seed": 7,
+                "best_epochs": [1, 2], "thresholds": {},
+                "threshold_selection": {"threshold": None, "fold_thresholds": {1: 0.2, 2: 0.8},
+                                        "thresholded_metrics_calibration_inclusive": False},
+                "metrics": {"roc_auc": 0.8, "n": 20}}
+    monkeypatch.setattr("rotating_evaluation.evaluate_rotating_run", summary)
+    result = compare_rotating_runs([Path("a"), Path("b")], tmp_path,
+                                   threshold_mode="per-fold", log_wandb=True)
+    assert calls == [("per-fold", True)] * 2
+    assert result["output_dir"].name.endswith("--per-fold")
+    assert not result["runs"]["thresholded_metrics_calibration_inclusive"].any()
+    assert result["runs"].threshold.isna().all()
+    assert json.loads(result["runs"].fold_thresholds.iloc[0]) == {"1": 0.2, "2": 0.8}

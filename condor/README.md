@@ -232,6 +232,29 @@ Both sweeps are gitignored (`configs/*`), so `sync_to_hpc.sh` carries them, not 
 
 ## `evaluate.sub` — evaluating a checkpoint
 
+Rotating-test CV supports both threshold modes for a whole sweep:
+
+```bash
+condor_submit args="--sweep-id ENTITY/PROJECT/SWEEP --threshold-mode unified" condor/evaluate.sub
+condor_submit args="--sweep-id ENTITY/PROJECT/SWEEP --threshold-mode per-fold" condor/evaluate.sub
+```
+
+`unified` is the default: choose one cut using all validation partitions.
+`per-fold` chooses each model's cut using only its own validation partition,
+then applies it to that model's test subjects. Both use the objective, threshold
+grid and tie-breaking rule stored in the run's configuration. AUROC and AP use
+the same pooled test probabilities in both modes; other metrics use the pooled
+binary decisions. No retraining is needed.
+
+Unified outputs retain `evaluations/<run-id>/`; per-fold outputs go into
+`evaluations/<run-id>/per-fold/`. Comparison folder names gain `--per-fold` for
+that mode. Selection JSON records every fold's cut; threshold curves include a
+fold column, and subject predictions record the applied threshold and source.
+Comparison CSVs record the mode and keep per-fold cuts as JSON rather than
+reporting an averaged threshold. `--log-wandb` also works for whole sweeps;
+per-fold results use separate `OOF Per-fold` summary keys. Age regression does
+not use thresholds and retains its existing output layout.
+
 Whatever you put in `args` is forwarded to `evaluate.py` unchanged, so every flag
 it accepts works:
 

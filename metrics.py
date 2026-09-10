@@ -320,7 +320,29 @@ def threshold_tie_index(
     return int(widest[(len(widest) - 1) // 2])
 
 
-def common_threshold_operating_point(
+def common_threshold_operating_point(fold_predictions, *args, **kwargs):
+    if len(fold_predictions or {}) < 2:
+        raise ValueError("cv_common_threshold needs at least 2 folds")
+    return _grid_threshold_operating_point(fold_predictions, *args, **kwargs)
+
+
+def per_fold_threshold_operating_point(fold_predictions, **kwargs):
+    """Optimize each cut using only that model's validation predictions."""
+    selections = {fold: _grid_threshold_operating_point({fold: data}, **kwargs)
+                  for fold, data in sorted(fold_predictions.items())}
+    if not selections:
+        raise ValueError("No validation predictions")
+    first = next(iter(selections.values()))
+    return {
+        "strategy": "per_fold_validation", "shared_threshold": None,
+        "fold_thresholds": {fold: result["shared_threshold"] for fold, result in selections.items()},
+        "objective": first["objective"], "tie_break": first["tie_break"],
+        "num_thresholds": first["num_thresholds"],
+        "curve": [{"fold": fold, **{key: value for key, value in row.items() if not key.startswith("fold_")}} for fold, result in selections.items() for row in result["curve"]],
+    }
+
+
+def _grid_threshold_operating_point(
     fold_predictions: dict,
     objective: str = DEFAULT_THRESHOLD_OBJECTIVE,
     num_thresholds: int = DEFAULT_NUM_THRESHOLDS,
@@ -341,9 +363,6 @@ def common_threshold_operating_point(
             "threshold.num_thresholds must be an integer >= 2, "
             f"got {num_thresholds!r}"
         )
-    if len(fold_predictions or {}) < 2:
-        raise ValueError("cv_common_threshold needs at least 2 folds")
-
     prepared = {}
     for fold, (y_true, y_prob) in sorted(fold_predictions.items()):
         y_true = np.asarray(y_true)
@@ -373,7 +392,7 @@ def common_threshold_operating_point(
 
         def aggregate(key):
             values = [metrics[key] for metrics in fold_metrics.values()]
-            return float(np.mean(values)), float(np.std(values, ddof=1))
+            return float(np.mean(values)), float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
 
         mean_objective, std_objective = aggregate(objective)
         mean_balanced, std_balanced = aggregate("balanced_accuracy")

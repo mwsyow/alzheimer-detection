@@ -1258,6 +1258,8 @@ def main():
             "positive rate it cannot hit exactly."
         ),
     )
+    parser.add_argument("--threshold-mode", choices=["unified", "per-fold"], default="unified",
+                        help="Rotating CV: one common validation threshold or a separate threshold from each model's validation fold.")
     args = parser.parse_args()
 
     if bool(args.checkpoint) == bool(args.sweep_id):
@@ -1274,7 +1276,7 @@ def main():
         else args.checkpoint
     )
     if len(paths) > 1 or args.sweep_id:
-        result = compare_rotating_runs(paths, Path("evaluations"))
+        result = compare_rotating_runs(paths, Path("evaluations"), threshold_mode=args.threshold_mode, log_wandb=args.log_wandb)
         print(f"Saved comparison to {result['output_dir']}")
         return
     args.checkpoint = paths[0]
@@ -1283,11 +1285,15 @@ def main():
     if args.checkpoint.is_dir():
         directory_metadata = load_metadata(args.checkpoint / "metadata.pth")
         if directory_metadata.get("cv", {}).get("strategy") == "rotating_test":
-            evaluate_rotating_run(args.checkpoint, log_wandb=args.log_wandb)
+            evaluate_rotating_run(args.checkpoint, log_wandb=args.log_wandb, threshold_mode=args.threshold_mode)
             return
+        if args.threshold_mode != "unified":
+            parser.error("--threshold-mode per-fold requires rotating-test CV")
         evaluate_cv_run(args.checkpoint, args)
         return
 
+    if args.threshold_mode != "unified":
+        parser.error("--threshold-mode per-fold requires a rotating-test CV run directory")
     checkpoint, metadata = load_checkpoint_and_metadata(args.checkpoint)
     config, config_report = resolve_eval_config(metadata, args.config)
     evaluation = resolve_evaluation_config(config, args)
