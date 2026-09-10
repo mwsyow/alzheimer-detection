@@ -1,5 +1,6 @@
-"""Leakage-safe OOF evaluation for rotating-test cross-validation runs."""
+"""OOF evaluation for rotating-test cross-validation runs."""
 
+import csv
 import json
 import re
 from pathlib import Path
@@ -16,7 +17,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from metrics import regression_metrics, threshold_tie_index
+from metrics import regression_metrics, select_cv_thresholds
 from tasks import adaptation_mode, is_regression
 from train import load_metadata
 
@@ -30,39 +31,87 @@ def _payloads(rows: pd.DataFrame) -> list[dict]:
     return payloads
 
 
-def _fold_threshold(payloads: list[dict], threshold_config: dict) -> tuple[float, dict]:
-    y_true = np.asarray([p["target"] for p in payloads], dtype=int)
-    y_prob = np.asarray([p["image_probability"] for p in payloads], dtype=float)
-    objective = threshold_config.get("objective", "balanced_accuracy")
-    count = int(threshold_config.get("num_thresholds", 1000))
-    grid = np.linspace(0.0, 1.0, count)
-    values = []
-    for threshold in grid:
-        pred = y_prob >= threshold
-        tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
-        sensitivity = tp / (tp + fn) if tp + fn else 0.0
-        specificity = tn / (tn + fp) if tn + fp else 0.0
-        precision = tp / (tp + fp) if tp + fp else 0.0
-        scores = {
-            "balanced_accuracy": (sensitivity + specificity) / 2,
-            "sensitivity": sensitivity,
-            "specificity": specificity,
-            "precision": precision,
-            "f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0,
-        }
-        if objective not in scores:
-            raise ValueError(f"Unsupported threshold objective: {objective!r}")
-        values.append(scores[objective])
-    index = threshold_tie_index(
-        values, grid, threshold_config.get("tie_break", "plateau_midpoint")
+CALIBRATION_INCLUSIVE_NOTE = (
+    "The shared threshold uses all rotating validation partitions. Every subject is "
+    "also tested in another rotation, so threshold-dependent OOF metrics are "
+    "calibration-inclusive; pooled ROC-AUC and average precision are threshold-free."
+)
+
+
+def _shared_threshold_selection(
+    manifest: pd.DataFrame, n_splits: int, threshold_config: dict, expected: set[str]
+) -> tuple[dict, int]:
+    """Choose one cut from every fold's validation predictions, never test rows."""
+    strategy = threshold_config.get("strategy", "cv_common_threshold")
+    if strategy != "cv_common_threshold":
+        raise ValueError(
+            "Rotating-test evaluation requires threshold.strategy="
+            f"'cv_common_threshold', got {strategy!r}"
+        )
+
+    fold_predictions = {}
+    validation_subjects = []
+    for fold in range(1, n_splits + 1):
+        rows = manifest[
+            (manifest["fold"] == fold) & (manifest["split"] == "validation")
+        ]
+        payloads = _payloads(rows)
+        if not payloads:
+            raise ValueError(f"Fold {fold} has no validation artifacts")
+        fold_predictions[fold] = (
+            np.asarray([payload["target"] for payload in payloads], dtype=int),
+            np.asarray(
+                [payload["image_probability"] for payload in payloads], dtype=float
+            ),
+        )
+        validation_subjects.extend(payload["subject_id"] for payload in payloads)
+
+    if len(validation_subjects) != len(set(validation_subjects)):
+        raise ValueError("Validation artifacts contain duplicate subjects")
+    if set(validation_subjects) != expected:
+        raise ValueError(
+            "Validation artifacts do not cover every manifest subject exactly once"
+        )
+
+    selection = select_cv_thresholds(
+        strategy="cv_common_threshold",
+        fold_predictions=fold_predictions,
+        objective=threshold_config.get("objective", "balanced_accuracy"),
+        num_thresholds=int(threshold_config.get("num_thresholds", 1000)),
+        tie_break=threshold_config.get("tie_break", "plateau_midpoint"),
     )
-    return float(grid[index]), {
-        "objective": objective,
-        "objective_value": float(values[index]),
-        "selected_index": int(index),
-        "num_thresholds": count,
-        "tie_break": threshold_config.get("tie_break", "plateau_midpoint"),
-    }
+    return selection, len(validation_subjects)
+
+
+def _save_threshold_selection(
+    destination: Path, selection: dict, validation_subjects: int
+) -> dict:
+    """Persist the shared cut and its full validation-only selection curve."""
+    curve = selection.get("curve", [])
+    selection_path = destination / "threshold_selection.json"
+    curve_path = destination / "threshold_curve.csv"
+    record = {key: value for key, value in selection.items() if key != "curve"}
+    record.update(
+        {
+            "threshold": float(selection["shared_threshold"]),
+            "threshold_source": "all_validation_folds",
+            "validation_folds": sorted(selection["fold_thresholds"]),
+            "validation_subjects": int(validation_subjects),
+            "thresholded_metrics_calibration_inclusive": True,
+            "calibration_note": CALIBRATION_INCLUSIVE_NOTE,
+            "artifacts": {
+                "threshold_selection": str(selection_path),
+                "threshold_curve": str(curve_path),
+            },
+        }
+    )
+    with selection_path.open("w") as handle:
+        json.dump(record, handle, indent=2)
+    with curve_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(curve[0]))
+        writer.writeheader()
+        writer.writerows(curve)
+    return record
 
 
 def _classification_metrics(y_true, y_prob, y_pred) -> dict:
@@ -108,6 +157,8 @@ def evaluate_rotating_run(
         raise ValueError("OOF test artifacts do not cover every manifest subject once")
 
     thresholds = {}
+    threshold_selection = None
+    validation_subject_count = None
     prediction_rows = []
     if is_regression(config):
         for payload in _payloads(test_rows):
@@ -129,14 +180,19 @@ def evaluate_rotating_run(
         frame = pd.DataFrame(prediction_rows).sort_values("subject_id")
         metrics = regression_metrics(frame["true_age"], frame["predicted_age"])
     else:
+        threshold_selection, validation_subject_count = _shared_threshold_selection(
+            manifest,
+            cv["n_splits"],
+            config.get("threshold", {}),
+            expected,
+        )
+        threshold = float(threshold_selection["shared_threshold"])
         for fold in range(1, cv["n_splits"] + 1):
-            val_rows = manifest[
-                (manifest["fold"] == fold) & (manifest["split"] == "validation")
-            ]
-            threshold, provenance = _fold_threshold(
-                _payloads(val_rows), config.get("threshold", {})
-            )
-            thresholds[fold] = {"threshold": threshold, **provenance}
+            thresholds[fold] = {
+                "threshold": threshold,
+                "strategy": "cv_common_threshold",
+                "threshold_source": "all_validation_folds",
+            }
             fold_test = test_rows[test_rows["fold"] == fold]
             for payload in _payloads(fold_test):
                 probability = float(payload["image_probability"])
@@ -148,6 +204,7 @@ def evaluate_rotating_run(
                         "probability": probability,
                         "prediction": int(probability >= threshold),
                         "threshold": threshold,
+                        "threshold_source": "all_validation_folds",
                         "fold": fold,
                         "seed": int(payload["seed"]),
                         "cv_random_seed": payload["cv_random_seed"],
@@ -168,6 +225,13 @@ def evaluate_rotating_run(
     destination = output_dir / metadata["run_id"]
     destination.mkdir(parents=True, exist_ok=True)
     frame.to_csv(destination / "oof_predictions.csv", index=False)
+    threshold_record = (
+        _save_threshold_selection(
+            destination, threshold_selection, validation_subject_count
+        )
+        if threshold_selection is not None
+        else None
+    )
     summary = {
         "run_id": metadata["run_id"],
         "task": config.get("task", {}).get("name", "ad_classification"),
@@ -184,6 +248,8 @@ def evaluate_rotating_run(
         "thresholds": thresholds,
         "metrics": metrics,
     }
+    if threshold_record is not None:
+        summary["threshold_selection"] = threshold_record
     with (destination / "oof_metrics.json").open("w") as handle:
         json.dump(summary, handle, indent=2)
     print(json.dumps(summary, indent=2))
@@ -203,6 +269,12 @@ def evaluate_rotating_run(
             if isinstance(value, (int, float)) and value is not None:
                 run.summary[f"OOF Test {key}"] = value
         run.summary["OOF Predictions"] = str(destination / "oof_predictions.csv")
+        if threshold_record is not None:
+            run.summary["OOF Shared Threshold"] = threshold_record["threshold"]
+            run.summary["OOF Threshold Calibration Inclusive"] = True
+            run.summary["OOF Threshold Selection"] = str(
+                destination / "threshold_selection.json"
+            )
         run.finish()
     return summary
 
@@ -228,7 +300,14 @@ def compare_rotating_runs(run_dirs: list[Path], output_dir: Path) -> dict:
         raise ValueError(f"Cannot aggregate mixed tasks: {sorted(tasks)}")
     rows = []
     for summary in summaries:
-        row = {key: value for key, value in summary.items() if key not in {"metrics", "thresholds"}}
+        row = {
+            key: value
+            for key, value in summary.items()
+            if key not in {"metrics", "thresholds", "threshold_selection"}
+        }
+        if "threshold_selection" in summary:
+            row["threshold"] = summary["threshold_selection"]["threshold"]
+            row["thresholded_metrics_calibration_inclusive"] = True
         row["best_epochs"] = json.dumps(row["best_epochs"])
         row.update(summary["metrics"])
         row.pop("confusion_matrix", None)

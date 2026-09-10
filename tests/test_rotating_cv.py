@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pandas as pd
 import pytest
 import torch
@@ -9,7 +12,7 @@ from models import build_model
 from tasks import StandardizedHuberLoss
 from conftest import FakeRun
 import train
-from rotating_evaluation import evaluate_rotating_run
+from rotating_evaluation import compare_rotating_runs, evaluate_rotating_run
 
 
 def items(n=50):
@@ -235,6 +238,33 @@ def test_rotating_training_exports_and_evaluates_one_oof_row_per_subject(
     assert predictions["subject_id"].nunique() == len(source.items)
     assert summary["metrics"]["n"] == len(source.items)
     assert len(summary["thresholds"]) == 3
+    assert predictions["threshold"].nunique() == 1
+    assert set(predictions["threshold_source"]) == {"all_validation_folds"}
+    shared = summary["threshold_selection"]["shared_threshold"]
+    assert predictions["threshold"].iloc[0] == pytest.approx(shared)
+    fold_thresholds = {
+        details["threshold"] for details in summary["thresholds"].values()
+    }
+    assert len(fold_thresholds) == 1
+    assert next(iter(fold_thresholds)) == pytest.approx(shared)
+    selection = summary["threshold_selection"]
+    assert selection["strategy"] == "cv_common_threshold"
+    assert selection["validation_folds"] == [1, 2, 3]
+    assert selection["validation_subjects"] == len(source.items)
+    assert selection["thresholded_metrics_calibration_inclusive"] is True
+    destination = tmp_path / "evaluations" / parent.id
+    with (destination / "threshold_selection.json").open() as handle:
+        assert json.load(handle)["threshold"] == pytest.approx(shared)
+    curve = pd.read_csv(destination / "threshold_curve.csv")
+    assert len(curve) == cfg["threshold"]["num_thresholds"]
+
+    # Test predictions affect reported metrics, never the validation-selected cut.
+    for artifact in manifest.loc[manifest["split"] == "test", "artifact"]:
+        payload = torch.load(artifact, map_location="cpu", weights_only=False)
+        payload["image_probability"] = 1.0 - payload["image_probability"]
+        torch.save(payload, artifact)
+    repeated = evaluate_rotating_run(run_dir, tmp_path / "reevaluated")
+    assert repeated["threshold_selection"]["shared_threshold"] == pytest.approx(shared)
 
 
 def test_age_rotating_training_saves_scalers_and_real_year_predictions(
@@ -263,3 +293,39 @@ def test_age_rotating_training_saves_scalers_and_real_year_predictions(
         tmp_path / "evaluations" / parent.id / "oof_predictions.csv"
     )
     assert {"true_age", "predicted_age", "residual"} <= set(predictions)
+    assert "threshold_selection" not in summary
+    assert not (tmp_path / "evaluations" / parent.id / "threshold_curve.csv").exists()
+
+
+def test_rotating_comparison_keeps_only_scalar_threshold_provenance(
+    tmp_path, monkeypatch
+):
+    def summary(path, output_dir):
+        threshold = 0.25 if path.name == "run-a" else 0.75
+        return {
+            "run_id": path.name,
+            "task": "ad_classification",
+            "architecture": "Simple3DCNN",
+            "adaptation_mode": "scratch",
+            "comparison_sha256": "same-recipe",
+            "config_sha256": path.name,
+            "seed": 1 if path.name == "run-a" else 2,
+            "cv_random_seed": 42,
+            "folds": 5,
+            "best_epochs": [1, 1, 1, 1, 1],
+            "thresholds": {},
+            "threshold_selection": {
+                "threshold": threshold,
+                "curve": [{"large": "nested payload"}],
+            },
+            "metrics": {"roc_auc": 0.7, "n": 20},
+        }
+
+    monkeypatch.setattr("rotating_evaluation.evaluate_rotating_run", summary)
+    result = compare_rotating_runs(
+        [Path("run-a"), Path("run-b")], tmp_path / "evaluations"
+    )
+    runs = result["runs"]
+    assert "threshold_selection" not in runs
+    assert runs["threshold"].tolist() == [0.25, 0.75]
+    assert runs["thresholded_metrics_calibration_inclusive"].all()

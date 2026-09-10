@@ -422,6 +422,13 @@ Training does not calculate or require this threshold.
 | `fpr_grid` | int ≥ 2 | `vertical_average` only. 101 gives 0.01 steps, finer than 20 negatives can resolve anyway. |
 | `threshold_grid` | int, or `0` | `threshold_average` only. `0` uses the union of the folds' own ROC thresholds, which is exact; a positive value uses that many evenly spaced points. |
 
+Rotating-test evaluation requires `cv_common_threshold`. It reads every rotation's
+validation artifacts, selects one shared cut, and applies it to all OOF test rows. The
+evaluation directory contains `threshold_selection.json` and `threshold_curve.csv`;
+`oof_predictions.csv` records the same threshold on every subject. Since every subject
+also occurs in a validation rotation, threshold-dependent OOF metrics are labelled
+calibration-inclusive. ROC-AUC and average precision do not use this cut.
+
 
 **`cv_common_threshold`** evaluates the same numerical candidate on every fold's
 out-of-fold probabilities, averages the configured objective across folds, and chooses

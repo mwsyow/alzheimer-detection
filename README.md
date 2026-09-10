@@ -77,9 +77,15 @@ uv run python evaluate.py --checkpoint checkpoints/<run1> --checkpoint checkpoin
 uv run python evaluate.py --sweep-id <entity>/<project>/<sweep> --checkpoint-root checkpoints
 ```
 
-The evaluator selects one threshold from each rotation's validation predictions and
-applies it only to that rotation's test subjects. It pools all OOF probabilities for
-ROC-AUC and AP, and pools the fold-local decisions for thresholded metrics.
+The evaluator selects one shared `cv_common_threshold` from all rotations' validation
+predictions and applies that same numerical cut to every held-out test fold. It pools
+all OOF probabilities for ROC-AUC and AP and saves the selection audit trail as
+`threshold_selection.json` plus `threshold_curve.csv`.
+
+Because every subject is validation once and test once across the rotations, the shared
+cut makes accuracy, sensitivity, specificity and F1 calibration-inclusive. These are
+reported with an explicit warning; pooled ROC-AUC and AP remain threshold-free and are
+the primary OOF results.
 
 Export reusable fold assignments for tabular models with:
 
