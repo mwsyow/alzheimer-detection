@@ -5,7 +5,7 @@ there. Source for the cluster facts below: `data/CS_HPC_Docu.pdf`.
 
 | File | Purpose |
 | --- | --- |
-| `sync_to_hpc.sh` | Push everything git can't carry (data, `.env`, configs, weights) |
+| `sync_to_hpc.sh` | Push inputs to HPC or pull generated outputs back locally |
 | `check_internet.sub` | Submit file for the worker-node connectivity probe |
 | `check_internet.sh` | The probe itself — runs inside the container, not directly |
 | `sweep_agent.sub` | Submit file for wandb sweep agents |
@@ -108,6 +108,29 @@ means the deletion target is always something you typed.
 **No SSH config needed.** One master connection is opened into a `mktemp -d`
 socket and reused by every `ssh`/`rsync`, so you authenticate once. An `EXIT` trap
 closes it; nothing is written to `~/.ssh`.
+
+### Pull results back to the local computer
+
+Run the same script locally with `--from-hpc`. Its download defaults are
+`checkpoints/`, `evaluations/`, `artifacts/`, and `condor/logs/`:
+
+```bash
+./condor/sync_to_hpc.sh <sic-user> --from-hpc
+```
+
+Because checkpoints and feature tensors can be large, you can pull only one run:
+
+```bash
+./condor/sync_to_hpc.sh <sic-user> --from-hpc --only \
+    checkpoints/<run-id> evaluations/<run-id> artifacts/<run-id>
+```
+
+Preview any transfer with `--dry-run`. Downloads merge with existing local
+outputs and never delete anything unless both `--only` and `--delete` are given:
+
+```bash
+./condor/sync_to_hpc.sh <sic-user> --from-hpc --only evaluations/<run-id> --dry-run
+```
 
 ---
 
