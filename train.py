@@ -2,7 +2,9 @@ import argparse
 import copy
 import json
 import math
+import os
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +47,7 @@ from metrics import (
 from models import build_model
 from tasks import StandardizedHuberLoss, is_regression, task_name
 from artifacts import consolidate_manifests, export_fold_artifacts, file_sha256
+from training_performance import EpochTimer, append_timing, state_digest, configure_optimized_training
 
 load_dotenv(override=True)
 
@@ -385,6 +388,7 @@ def train(
     on_epoch_end=None,
     best_result: dict = None,
     target_scaler: dict = None,
+    performance: dict = None,
 ):
     if isinstance(epochs, int):
         epochs = range(epochs)
@@ -413,16 +417,24 @@ def train(
     final_train_metrics = None
     # Carried across a resume so an interrupted fold keeps the best epoch it already found.
     best_result = dict(best_result) if best_result else None
+    performance = performance or {}
+    optimized = performance.get("enabled", False)
 
     for ep in epochs:
+        if hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(ep)
+        timer = EpochTimer(device) if performance.get("profile", False) else None
+        epoch_started = time.perf_counter()
         model.train()
         train_logits = []
         train_labels = []
         learning_rate = None
-        for images, labels in train_loader:
+        for images, labels in (timer.batches(train_loader) if timer else train_loader):
             # The scheduler advances after the optimizer update, so this is the rate
             # actually applied to this batch rather than the one prepared for the next.
             learning_rate = optim.param_groups[0]["lr"]
+            if timer:
+                timer.start_step()
             _, outputs = train_step(
                 model=model,
                 optim=optim,
@@ -431,8 +443,11 @@ def train(
                 images=images,
                 labels=labels,
                 device=device,
+                non_blocking=optimized,
             )
-            train_logits.append(outputs.detach().cpu())
+            if timer:
+                timer.end_step()
+            train_logits.append(outputs.detach() if optimized else outputs.detach().cpu())
             train_labels.append(labels.detach().cpu())
 
         # Training predictions come from the parameters as they were mid-epoch and with
@@ -458,6 +473,8 @@ def train(
             )
             epoch_metric_keys = EPOCH_LOG_METRICS
         final_train_metrics = train_metrics
+        train_seconds = time.perf_counter() - epoch_started
+        validation_started = time.perf_counter()
 
         val_metrics = None
         val_loss = None
@@ -469,6 +486,7 @@ def train(
                 loader=val_loader,
                 loss_fn=loss,
                 device=device,
+                optimized=optimized,
             )
             val_metrics = (
                 regression_metrics(
@@ -505,6 +523,8 @@ def train(
                 # Incrementing without one would early-stop a refit run at `patience`.
                 early_stopping_counter += 1
 
+        validation_seconds = time.perf_counter() - validation_started
+        checkpoint_started = time.perf_counter()
         checkpoint_kwargs = {
             "epoch": ep,
             "model": model,
@@ -556,6 +576,7 @@ def train(
                 **checkpoint_kwargs,
             )
 
+        checkpoint_seconds = time.perf_counter() - checkpoint_started
         early_stopped = (
             has_validation
             and early_stopping_config.get("enabled", False)
@@ -578,6 +599,19 @@ def train(
                 early_stopping_counter=early_stopping_counter,
             )
 
+        if timer:
+            append_timing(checkpoint_dir / "timings.csv", {
+                "fold": fold, "epoch": ep, "train_seconds": train_seconds,
+                "data_wait_seconds": timer.data_wait, "cuda_step_seconds": timer.gpu_seconds(),
+                "validation_seconds": validation_seconds, "checkpoint_seconds": checkpoint_seconds,
+                "epoch_seconds": time.perf_counter() - epoch_started,
+                "samples_per_second": timer.samples / train_seconds,
+                "peak_gpu_bytes": torch.cuda.max_memory_allocated(device) if timer.cuda else 0,
+                "train_loss": train_metrics["loss"], "validation_loss": val_loss,
+                "sample_order": json.dumps([train_loader.dataset.indices[i] for i in train_loader.sampler])
+                if hasattr(train_loader.sampler, "set_epoch") else "",
+            })
+            print(f"Fold {fold} epoch {ep + 1}: train={train_seconds:.2f}s val={validation_seconds:.2f}s", flush=True)
         if early_stopped:
             break
 
@@ -608,11 +642,12 @@ def train_step(
     labels: torch.Tensor,
     device: torch.device = None,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
+    non_blocking: bool = False,
 ):
     model.train()
     if device is not None:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=non_blocking)
+        labels = labels.to(device, non_blocking=non_blocking)
     optim.zero_grad()  # Clear gradients before each step
     output = model(images)
     train_loss = loss(output, labels)
@@ -971,6 +1006,10 @@ def run_rotating_cross_validation(
             cv_state["target_scalers"][fold_number] = target_scaler
         loss = build_loss(config, target_scaler=target_scaler)
         model = build_model(config, initialize_pretrained=fold_checkpoint is None).to(device)
+        if config.get("performance", {}).get("profile", False):
+            append_timing(checkpoint_dir / "initialization.csv", {
+                "fold": fold_number, "state_sha256": state_digest(model),
+            })
         optim = build_optimizer(config, model)
         lr_scheduler = build_lr_scheduler(
             config, optim, epochs=config["epochs"], steps_per_epoch=len(train_loader)
@@ -1017,6 +1056,7 @@ def run_rotating_cross_validation(
             on_epoch_end=on_epoch_end,
             best_result=best_result,
             target_scaler=target_scaler,
+            performance=config.get("performance"),
         )
         if result["best_result"] is None:
             raise RuntimeError(f"Fold {fold_number} produced no best checkpoint")
@@ -1025,6 +1065,7 @@ def run_rotating_cross_validation(
         best_path = current_dir / CV_BEST_FILENAME
         best_checkpoint = torch.load(best_path, map_location="cpu")
         model.load_state_dict(best_checkpoint["model_state_dict"])
+        export_started = time.perf_counter()
         export_fold_artifacts(
             model=model,
             source=source,
@@ -1037,6 +1078,11 @@ def run_rotating_cross_validation(
             loss_fn=loss,
             output_root=artifact_root,
         )
+        if config.get("performance", {}).get("profile", False):
+            append_timing(checkpoint_dir / "export_timings.csv", {
+                "fold": fold_number, "export_seconds": time.perf_counter() - export_started,
+            })
+        del train_loader, val_loader
 
         cv_state["completed_folds"] = sorted(
             set(cv_state["completed_folds"]) | {fold_number}
@@ -1318,7 +1364,10 @@ def runner(
     return result
 
 
-def main(legacy_only: bool = False):
+def main(legacy_only: bool = False, optimized_only: bool = False):
+    # W&B sweep commands may already hard-code train.py. The HPC wrapper selects
+    # the optimized mode through the inherited environment, without a new sweep.
+    optimized_only = optimized_only or os.environ.get("ALZHEIMER_TRAIN_OPTIMIZED") == "1"
     parser = argparse.ArgumentParser(description="Train a 3D CNN on OASIS MRI data.")
     parser.add_argument(
         "--config",
@@ -1361,6 +1410,9 @@ def main(legacy_only: bool = False):
     else:
         config = normalize_task_config(load_config(args.config))
 
+    if optimized_only:
+        configure_optimized_training(config)
+
     resolved_name = metadata.get("wandb_run_name") if metadata is not None else None
     if resolved_name is not None:
         wandb_init_kwargs["name"] = resolved_name
@@ -1383,13 +1435,24 @@ def main(legacy_only: bool = False):
         config = apply_sweep_overrides(config, wandb_run.config)
         config = normalize_threshold_config(config)
         config = normalize_task_config(config)
+        if optimized_only:
+            configure_optimized_training(config)
         wandb_run.config.update(config, allow_val_change=True)
         wandb_run.name = run_id_wandb_name(config.get("wandb_name"), wandb_run.id)
 
     if legacy_only and config.get("cv", {}).get("strategy") == "rotating_test":
         raise ValueError("train_legacy.py cannot run cv.strategy='rotating_test'")
+    if optimized_only and (
+        not config.get("cv", {}).get("enabled", False)
+        or config["cv"].get("strategy") != "rotating_test"
+    ):
+        raise ValueError("train_optimized.py requires enabled rotating_test CV")
     if is_regression(config) and config.get("cv", {}).get("strategy") != "rotating_test":
         raise ValueError("age_regression is supported with rotating-test CV only")
+
+    if optimized_only:
+        print("Trainer: train_optimized.py mode | cache:", config["performance"]["cache_dir"], flush=True)
+        wandb_run.config.update(config, allow_val_change=True)
 
     runner(
         run=wandb_run,

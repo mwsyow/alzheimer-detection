@@ -20,6 +20,9 @@ Documentation lives in three places: this file for the workflow end to end,
 [`configs/README.md`](configs/README.md) for every config key, and
 [`condor/README.md`](condor/README.md) for running on the HTCondor cluster.
 
+For opt-in rotating-CV data-loading optimizations and a paired five-epoch GPU pilot,
+see [`docs/training_performance.md`](docs/training_performance.md).
+
 ## Code Flow
 
 The main entrypoint is `train.py`. Historical fixed-test, single-split and refit runs

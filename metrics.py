@@ -158,6 +158,7 @@ def collect_predictions(
     loader,
     loss_fn: nn.Module,
     device: torch.device = None,
+    optimized: bool = False,
 ):
     """Run the whole loader in eval mode and accumulate raw logits.
 
@@ -171,8 +172,9 @@ def collect_predictions(
     with torch.no_grad():
         for images, labels in loader:
             if device is not None:
-                images = images.to(device)
-            logit_batches.append(model(images).detach().cpu())
+                images = images.to(device, non_blocking=optimized)
+            outputs = model(images).detach()
+            logit_batches.append(outputs if optimized else outputs.cpu())
             label_batches.append(labels.detach().cpu())
 
     return summarize_predictions(

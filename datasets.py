@@ -3,7 +3,8 @@ import glob
 
 import pandas as pd
 import torch
-from monai.data import DataLoader, Dataset as MonaiDataset, NibabelReader
+from monai.data import DataLoader, Dataset as MonaiDataset, NibabelReader, PersistentDataset
+from monai.data.utils import pickle_hashing
 from monai.transforms import (
     Compose,
     EnsureChannelFirstd,
@@ -24,6 +25,7 @@ from monai.transforms import (
 )
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import Subset
+from training_performance import EpochSampler, input_cache_hash
 
 
 def oasis_scan_id(path: Path) -> str:
@@ -795,13 +797,28 @@ class Dataset(MonaiDataset):
         return item["image"], target
 
 
+class CachedDataset(PersistentDataset):
+    """Persistent deterministic prefix with the existing (image, target) API."""
+
+    def __init__(self, *args, target_key="label", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.target_key = target_key
+
+    def __getitem__(self, index):
+        item = super().__getitem__(index)
+        target = item[self.target_key]
+        if self.target_key == "age":
+            target = torch.as_tensor(target, dtype=torch.float32)
+        return item["image"], target
+
+
 class DatasetSource:
     """Items and per-mode Datasets, built once and then sliced by index.
 
-    A Dataset is constructed per mode rather than per loader, so the folds of a
-    cross-validation run all read through the same objects. That is also the seam for
-    a future caching option: swapping Dataset for a CacheDataset in _build_dataset
-    would populate the cache once and let every fold reuse it.
+    A Dataset is constructed per mode rather than per loader, so all folds reuse
+    the same objects. With performance.enabled, a persistent disk cache stores
+    deterministic preprocessing and is reused across folds. Identical deterministic
+    transform prefixes also share cache entries across modes.
 
     Train and eval cannot share one Dataset because augmentation is train-only, so
     there is one per mode rather than one overall.
@@ -823,6 +840,16 @@ class DatasetSource:
         self._datasets: dict[str, Dataset] = {}
 
     def _build_dataset(self, mode: str) -> Dataset:
+        performance = self.config.get("performance", {})
+        if performance.get("enabled", False):
+            return CachedDataset(
+                data=self.items,
+                transform=build_transforms(self.backend, self.config, mode),
+                target_key=self.target_key,
+                cache_dir=performance.get("cache_dir", ".cache/rotating_cv"),
+                hash_func=input_cache_hash,
+                hash_transform=pickle_hashing,
+            )
         return Dataset(
             data=self.items,
             transform=build_transforms(self.backend, self.config, mode),
@@ -851,11 +878,25 @@ class DatasetSource:
 
     def loader(self, indices: list[int], mode: str, shuffle: bool = False):
         dataloader_config = self.config["dataloader"]
+        performance = self.config.get("performance", {})
+        options = {}
+        if performance:
+            seed = int(self.config.get("seed", 0))
+            options["generator"] = torch.Generator().manual_seed(seed)
+            if shuffle:
+                options["sampler"] = EpochSampler(len(indices), seed)
+                shuffle = False
+        if performance.get("enabled", False):
+            options["pin_memory"] = torch.cuda.is_available()
+            if dataloader_config["num_workers"] > 0:
+                options["persistent_workers"] = performance.get("persistent_workers", True)
+                options["prefetch_factor"] = performance.get("prefetch_factor", 1)
         return DataLoader(
             Subset(self.dataset(mode), indices),
             batch_size=dataloader_config["batch_size"],
             shuffle=shuffle,
             num_workers=dataloader_config["num_workers"],
+            **options,
         )
 
     def train_val_loaders(self, split_indices: dict[str, list[int]]):

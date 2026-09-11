@@ -35,6 +35,8 @@ def comparison_fingerprint(config: dict) -> str:
     comparable.pop("evaluation", None)
     comparable.pop("artifacts", None)
     comparable.get("checkpoint", {}).pop("dir", None)
+    # Per-job scratch paths must not split otherwise identical sweep groups.
+    comparable.get("performance", {}).pop("cache_dir", None)
     return config_fingerprint(comparable)
 
 
@@ -61,6 +63,7 @@ def export_fold_artifacts(
     fingerprint = config_fingerprint(config)
     comparable_fingerprint = comparison_fingerprint(config)
     rows = []
+    optimized = config.get("performance", {}).get("enabled", False)
     split_keys = {"train": "train_idx", "validation": "val_idx", "test": "test_idx"}
 
     with torch.no_grad():
@@ -69,13 +72,16 @@ def export_fold_artifacts(
             loader = source.loader(indices, mode="test", shuffle=False)
             cursor = 0
             for images, targets in loader:
-                images = images.to(device)
+                images = images.to(device, non_blocking=optimized)
                 outputs = model.forward_with_features(images)
                 batch_size = images.shape[0]
                 batch_indices = indices[cursor : cursor + batch_size]
                 cursor += batch_size
 
                 raw_output = outputs["output"].detach().cpu()
+                if optimized:
+                    outputs["F"] = outputs["F"].detach().cpu()
+                    outputs["hI"] = outputs["hI"].detach().cpu()
                 if is_regression(config):
                     predictions = loss_fn.inverse(raw_output.reshape(-1)).cpu()
                     probabilities = logits = None

@@ -185,6 +185,27 @@ four trials run concurrently. Override without editing the file:
 condor_submit n_agents=2 sweep_id=<...> condor/sweep_agent.sub
 ```
 
+Select optimized rotating-CV training for newly submitted agents:
+
+```bash
+condor_submit args="--optimized" n_agents=4 sweep_id=<entity>/<project>/<id> condor/sweep_agent.sub
+```
+
+Without `args="--optimized"`, behavior is unchanged. The flag is consumed by the
+wrapper, not passed to `wandb agent`. It sets an inherited trainer selector so even
+an existing sweep whose command hard-codes `train.py` uses the same optimized mode
+as `train_optimized.py`; no sweep YAML edits or sweep recreation are needed.
+This applies to this project's `train.py`/`train_optimized.py`, not arbitrary programs.
+Already-running agents are not changed. Avoid mixing optimization modes in one sweep
+if you want consistent training/data-order settings across its runs.
+
+Optimized jobs store deterministic preprocessing in node-local
+`${_CONDOR_SCRATCH_DIR:-/tmp}/alzheimer-preprocessing`, reused across folds and trials
+within the job. That runtime path is recorded in metadata but excluded from
+comparison grouping. Checkpoints and exported features still go to their configured
+NFS directories. Logs print the trainer and cache path. The flag requires enabled
+`rotating_test` CV.
+
 Use the `n_agents` macro, **not** `condor_submit -queue N`. HTCondor's `-queue` takes a
 whole queue *statement*, which may contain spaces (`-queue 3 item in list`), so it has
 to be the last argument on the command line — `condor_submit -queue 1 sweep_id=... \
@@ -295,11 +316,15 @@ still pushes the test set through K models.
 ## `train.sub` — a single training run
 
 For one configuration, where a sweep's parent/child bookkeeping is just noise.
-Whatever you put in `args` is forwarded to `train.py` unchanged:
+Use `--optimized` inside `args` to select `train_optimized.py`; all other arguments
+are forwarded unchanged. Omitting it selects `train.py`:
 
 ```bash
 # a 5-fold cross-validation run from a config
 condor_submit args="--config configs/efficientnet_b0_bnfix.json" condor/train.sub
+
+# optimized rotating-CV run
+condor_submit args="--optimized --config configs/bench_simple3dcnn.json" condor/train.sub
 
 # pick up an interrupted CV run at the fold and epoch it stopped at
 condor_submit args="--config configs/efficientnet_b0_bnfix.json --resume checkpoints/<run_id>" \
